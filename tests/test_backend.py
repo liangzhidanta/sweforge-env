@@ -56,3 +56,34 @@ def test_verify_rejects_tampered_patch():
     result = backend.verify(_task(), tampered)
     assert not result.integrity_ok
     assert not result.resolved
+
+
+def test_verify_respects_bundle_integrity_protected(tmp_path):
+    import json
+    import shutil
+
+    bundle_dir = tmp_path / "toy_cache_aliasing"
+    shutil.copytree(EXAMPLES, bundle_dir)
+    manifest_path = bundle_dir / "task_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["integrity_protected"] = ["secret.txt"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (bundle_dir / "repo" / "secret.txt").write_text("classified", encoding="utf-8")
+
+    task = load_task_bundle(bundle_dir).task
+    backend = LocalDockerBackend(tmp_path)
+    patch = "diff --git a/secret.txt b/secret.txt\n--- a/secret.txt\n+++ b/secret.txt\n@@ -1 +1 @@\n-classified\n+owned\n"
+    result = backend.verify(task, patch)
+    assert not result.integrity_ok
+    assert "secret.txt" in result.details["integrity"]
+
+
+def test_verify_apply_failure_reports_reason():
+    backend = LocalDockerBackend(EXAMPLES.parent)
+    malformed = ("diff --git a/toy_cache/cache.py b/toy_cache/cache.py\n"
+                 "--- a/toy_cache/cache.py\n"
+                 "+++ b/toy_cache/cache.py\n"
+                 "@@ not a hunk header @@\n")
+    result = backend.verify(_task(), malformed)
+    assert not result.integrity_ok
+    assert "git apply failed" in result.details["integrity"]

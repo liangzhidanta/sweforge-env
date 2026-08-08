@@ -104,12 +104,18 @@ def _run_tests(executor: Executor, test_command: Sequence[str], test_ids: Sequen
 
 def _verify_clean(fresh: LocalExecutor, task: TaskSpec, patch: str, bundle: TaskBundle) -> VerificationResult:
     _git_init_workspace(fresh)
-    integrity_ok, integrity_reason = _check_integrity(patch, task.protected_paths)
+    protected = (*task.protected_paths, *bundle.integrity_protected)
+    integrity_ok, integrity_reason = _check_integrity(patch, protected)
     apply_result = None
+    f2p_timeout = False
+    p2p_timeout = False
     if integrity_ok:
         apply_result = fresh.run_argv(("git", "apply", "--allow-empty", "--whitespace=nowarn", "-"),
                                       timeout=30, input_text=patch)
-        integrity_ok = apply_result.exit_code == 0
+        if apply_result.exit_code != 0:
+            integrity_ok = False
+            reason = apply_result.stderr.strip()
+            integrity_reason = f"git apply failed: {reason}" if reason else "git apply failed"
     if integrity_ok:
         _inject_hidden_tests(fresh, bundle.hidden_tests)
     if not integrity_ok:
@@ -118,7 +124,7 @@ def _verify_clean(fresh: LocalExecutor, task: TaskSpec, patch: str, bundle: Task
     else:
         f2p_outcomes, f2p_timeout = _run_tests(fresh, task.test_command, task.fail_to_pass)
         p2p_outcomes, p2p_timeout = _run_tests(fresh, task.test_command, task.pass_to_pass)
-    timed_out = bool(apply_result and apply_result.timed_out) or locals().get("f2p_timeout", False) or locals().get("p2p_timeout", False)
+    timed_out = bool(apply_result and apply_result.timed_out) or f2p_timeout or p2p_timeout
     f2p_passed = sum(1 for ok in f2p_outcomes.values() if ok)
     f2p_total = len(f2p_outcomes)
     f2p_ratio = f2p_passed / f2p_total if f2p_total else 1.0
@@ -142,16 +148,18 @@ class LocalDockerBackend:
         self.use_docker = use_docker
 
     def _make_executor(self, task: TaskSpec) -> Executor:
-        bundle = load_task_bundle(self.bundles_dir / task.task_id)
+        return self._executor_from_bundle(load_task_bundle(self.bundles_dir / task.task_id))
+
+    def _executor_from_bundle(self, bundle: TaskBundle) -> Executor:
         if self.use_docker:
             raise NotImplementedError("DockerExecutor wiring lands in M2")
-        executor = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=task.protected_paths)
+        executor = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=bundle.task.protected_paths)
         _git_init_workspace(executor)
         return executor
 
     def create(self, task: TaskSpec) -> EnvHandle:
         bundle = load_task_bundle(self.bundles_dir / task.task_id)
-        executor = self._make_executor(task)
+        executor = self._executor_from_bundle(bundle)
         return EnvHandle(env_id=uuid.uuid4().hex[:12], task=bundle.task,
                          executor=executor, workspace=executor.root)
 
