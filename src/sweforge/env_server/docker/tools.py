@@ -23,7 +23,7 @@ def execute_action(executor: Executor, action: ToolAction, env_id: str) -> Obser
         if tool == "str_replace":
             return _str_replace(executor, args, action.request_id, env_id, started)
         return _error(action.request_id, env_id, tool, f"unknown tool: {tool}", started)
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, re.error) as error:
         return _error(action.request_id, env_id, tool, str(error), started)
 
 
@@ -52,28 +52,6 @@ def _bash(executor: Executor, args: dict, request_id: str, env_id: str, started:
     )
 
 
-def _search_regex(executor: Executor, pattern: str, path: str, max_results: int) -> list[str]:
-    root = executor.path_policy.resolve(path)
-    expression = re.compile(pattern)
-    results: list[str] = []
-    paths = [root] if root.is_file() else sorted(root.rglob("*"))
-    for candidate in paths:
-        if not candidate.is_file():
-            continue
-        try:
-            relative = candidate.relative_to(executor.root).as_posix()
-            executor.path_policy.resolve(relative)  # skip protected paths
-            lines = candidate.read_text(encoding="utf-8").splitlines()
-        except (UnicodeDecodeError, OSError, ValueError):
-            continue
-        for number, line in enumerate(lines, start=1):
-            if expression.search(line):
-                results.append(f"{relative}:{number}:{line}")
-                if len(results) >= max_results:
-                    return results
-    return results
-
-
 def _bound(max_chars: int, value: str) -> tuple[str, bool]:
     if len(value) <= max_chars:
         return value, False
@@ -86,7 +64,7 @@ def _search(executor: Executor, args: dict, request_id: str, env_id: str, starte
     max_results = int(args.get("max_results", 50))
     if not pattern:
         raise ValueError("pattern cannot be empty")
-    matches = _search_regex(executor, pattern, path, max_results)
+    matches = executor.search_text(pattern, path, max_results)
     content = "\n".join(matches) if matches else "NO_MATCHES"
     content, truncated = _bound(executor.max_output_chars, content)
     return Observation(

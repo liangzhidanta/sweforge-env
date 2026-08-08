@@ -101,3 +101,31 @@ def test_str_replace_multiple_expected(tmp_path):
                                  ToolAction("str_replace", {"path": "b.txt", "old": "a", "new": "b",
                                                             "expected_occurrences": 3}, request_id="r1"), "e1")
     assert observation.exit_code == 0 and executor.read_text("b.txt") == "bbb"
+
+
+def test_search_malformed_pattern(tmp_path):
+    observation = execute_action(_executor(tmp_path),
+                                 ToolAction("search", {"pattern": "[unclosed"}, request_id="r1"), "e1")
+    assert observation.exit_code is None and observation.content.startswith("ERROR:")
+
+
+class _FakeExecutor:
+    max_output_chars = 20_000
+    max_view_lines = 200
+    root = None
+    path_policy = None
+
+    def __init__(self):
+        self.calls = []
+
+    def search_text(self, pattern, path, max_results):
+        self.calls.append((pattern, path, max_results))
+        return ["a.py:1:first", "b.py:2:second"]
+
+
+def test_search_dispatches_through_executor():
+    fake = _FakeExecutor()
+    observation = execute_action(fake, ToolAction("search", {"pattern": "x"}, request_id="r1"), "e1")
+    assert observation.exit_code == 0
+    assert "a.py:1:first" in observation.content
+    assert fake.calls == [("x", ".", 50)]

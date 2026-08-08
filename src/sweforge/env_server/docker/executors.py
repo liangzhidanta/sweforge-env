@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +36,7 @@ class Executor(Protocol):
     def run_shell(self, command: str, timeout: float, cwd: str = ".") -> CommandResult: ...
     def read_text(self, path: str) -> str: ...
     def write_text(self, path: str, content: str) -> None: ...
+    def search_text(self, pattern: str, path: str, max_results: int) -> list[str]: ...
     def close(self) -> None: ...
 
 
@@ -117,6 +119,27 @@ class LocalExecutor:
         candidate = self.path_policy.resolve(path)
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
+
+    def search_text(self, pattern: str, path: str = ".", max_results: int = 50) -> list[str]:
+        root = self.path_policy.resolve(path)
+        expression = re.compile(pattern)
+        results: list[str] = []
+        paths = [root] if root.is_file() else sorted(root.rglob("*"))
+        for candidate in paths:
+            if not candidate.is_file():
+                continue
+            try:
+                relative = candidate.relative_to(self.root).as_posix()
+                self.path_policy.resolve(relative)  # skip protected paths
+                lines = candidate.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError, ValueError):
+                continue
+            for number, line in enumerate(lines, start=1):
+                if expression.search(line):
+                    results.append(f"{relative}:{number}:{line}")
+                    if len(results) >= max_results:
+                        return results
+        return results
 
     def close(self) -> None:
         if self._temporary is not None:
@@ -217,6 +240,9 @@ class DockerExecutor:
                             input_text=content, max_chars=self.max_output_chars)
         if result.exit_code != 0:
             raise OSError(result.stderr)
+
+    def search_text(self, pattern: str, path: str = ".", max_results: int = 50) -> list[str]:
+        raise NotImplementedError("DockerExecutor.search_text lands in M2")
 
     def close(self) -> None:
         if not self._started:
