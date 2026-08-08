@@ -3,6 +3,22 @@
 - Date: 2026-08-08
 - Status: Approved scope (M1), awaiting AutoDL schema reconciliation
 
+> **2026-08-08 status update（R1+R2 落地后，本文档部分内容已被取代）**
+>
+> - **协议**: AutoDL canonical 契约已逐字节引入（`schemas/`、`protocol/`、`environment/`、
+>   `reward/`、`agent/`，见 `src/sweforge/VENDORED.md`）。下文 §2 描述的老式
+>   `schemas.py` dataclass `ToolAction(tool, arguments, request_id)` **已废弃**，
+>   以 vendored pydantic 五工具 discriminated union 为准（含 `finish`）。
+> - **Docker**: 本机已通过 colima 装好（VM 方案, daemon 出网走宿主机代理）。
+>   下文"`docker` 未安装"与"M2 才接 DockerExecutor 完整流程" **不再成立**；
+>   `DockerExecutor`（`--user 1000:1000`、`--network none`、tar+`docker cp` 注入
+>   快照）已可用，demo/server 加 `--docker` 即走真实容器。
+> - **Server / 联调**: §8 FastAPI server（vendored `environment.server.make_app`）
+>   已用 `env_server/server.py`（Mac 侧入口, 包 LocalDockerBackend）接上；
+>   `interop_mac.py` 本地 E2E + AgentLoop `validate_trajectory` 全链路通过。
+>   这些原列为 M2 范围（"FastAPI /v1 路由、SSH tunnel、AutoDL E2E"）已提前落地。
+> - 以上现状以代码与 `USAGE.txt` 为准；本文档保留原始 M1 设计决策供追溯。
+
 ## 1. Context
 
 SWE-Forge 分两侧：**AutoDL**（模型 / SFT / Agent Loop / Rollout / GRPO）与 **Mac**（执行环境：Environment Server / LocalDockerBackend / Docker Manager / Task Containers / Clean Verifier / Task Registry）。本设计只覆盖 Mac 侧的 **M1** 里程碑，对应任务书的开发顺序 1/3/4/6/7 及"现在首先完成"部分：

@@ -1,6 +1,11 @@
 from sweforge.env_server.docker.executors import LocalExecutor
 from sweforge.env_server.docker.tools import execute_action
-from sweforge.schemas import ToolAction
+from sweforge.protocol.tools import (
+    BashAction,
+    SearchAction,
+    StrReplaceAction,
+    ViewFileAction,
+)
 
 
 def _executor(tmp_path):
@@ -9,123 +14,138 @@ def _executor(tmp_path):
 
 
 def test_bash_success(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("bash", {"command": "echo ok"}, request_id="r1"), "e1")
-    assert observation.tool == "bash" and observation.exit_code == 0
+    observation = execute_action(_executor(tmp_path), BashAction(command="echo ok"))
+    assert observation.exit_code == 0
     assert observation.stdout.strip() == "ok"
-    assert observation.request_id == "r1" and observation.env_id == "e1"
-
-
-def test_bash_empty_command(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("bash", {"command": "  "}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "command cannot be empty" in observation.content
-
-
-def test_bash_timeout(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("bash", {"command": "sleep 5", "timeout": 0.2}, request_id="r1"), "e1")
-    assert observation.exit_code == 124
-
-
-def test_unknown_tool(tmp_path):
-    observation = execute_action(_executor(tmp_path), ToolAction("curl", {}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "unknown tool" in observation.content
 
 
 def test_search_found(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("search", {"pattern": "get_or_compute"}, request_id="r1"), "e1")
-    assert observation.exit_code == 0 and "a.py:1" in observation.content
+    observation = execute_action(_executor(tmp_path), SearchAction(query="get_or_compute"))
+    assert len(observation.matches) == 1
+    assert observation.matches[0].path == "a.py"
+    assert observation.matches[0].line == 1
+    assert "get_or_compute" in observation.matches[0].content
 
 
 def test_search_no_match(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("search", {"pattern": "zzz_no_match"}, request_id="r1"), "e1")
-    assert observation.exit_code == 1 and observation.content == "NO_MATCHES"
+    observation = execute_action(_executor(tmp_path), SearchAction(query="zzz_no_match"))
+    assert observation.matches == []
+    assert observation.truncated is False
 
 
-def test_search_max_results(tmp_path):
+def test_search_truncated(tmp_path):
     executor = LocalExecutor(tmp_path)
-    executor.write_text("b.txt", "\n".join(f"needle {i}" for i in range(100)))
-    observation = execute_action(executor,
-                                 ToolAction("search", {"pattern": "needle", "max_results": 5}, request_id="r1"), "e1")
-    assert len(observation.content.splitlines()) == 5
+    executor.write_text("b.txt", "\n".join(f"needle {i}" for i in range(250)))
+    observation = execute_action(executor, SearchAction(query="needle"))
+    assert observation.truncated is True
+    assert len(observation.matches) == 200  # _MAX_SEARCH_MATCHES
+
+
+def test_search_invalid_regex(tmp_path):
+    observation = execute_action(_executor(tmp_path), SearchAction(query="[unclosed"))
+    assert observation.matches == []
+    assert observation.error is not None
+
+
+def test_search_path_not_found(tmp_path):
+    observation = execute_action(_executor(tmp_path), SearchAction(query="x", path="missing.txt"))
+    assert observation.matches == []
+    assert "path not found" in observation.error
+
+
+def test_search_escape(tmp_path):
+    observation = execute_action(_executor(tmp_path), SearchAction(query="x", path="../secret.txt"))
+    assert observation.matches == []
+    assert observation.error is not None
 
 
 def test_view_file_range(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("view_file", {"path": "a.py", "start_line": 1, "end_line": 2}, request_id="r1"), "e1")
-    assert observation.exit_code == 0 and "| def get_or_compute" in observation.content
+    observation = execute_action(
+        _executor(tmp_path), ViewFileAction(path="a.py", start_line=1, end_line=2)
+    )
+    assert observation.start_line == 1 and observation.end_line == 2
+    assert "def get_or_compute" in observation.content
+    assert observation.total_lines == 2
 
 
-def test_view_file_invalid_range(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("view_file", {"path": "a.py", "start_line": 5, "end_line": 2}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "invalid line range" in observation.content
+def test_view_file_default_bounds(tmp_path):
+    observation = execute_action(_executor(tmp_path), ViewFileAction(path="a.py"))
+    assert observation.start_line == 1 and observation.end_line == 2
+    assert observation.content.splitlines()[0].startswith("     1\t")
+
+
+def test_view_file_not_found(tmp_path):
+    observation = execute_action(_executor(tmp_path), ViewFileAction(path="missing.txt"))
+    assert observation.error is not None and observation.start_line == 0
+
+
+def test_view_file_is_directory(tmp_path):
+    observation = execute_action(_executor(tmp_path), ViewFileAction(path="."))
+    assert observation.error is not None and "directory" in observation.error
+
+
+def test_view_file_out_of_bounds(tmp_path):
+    observation = execute_action(
+        _executor(tmp_path), ViewFileAction(path="a.py", start_line=5, end_line=9)
+    )
+    assert observation.error is not None and "out of bounds" in observation.error
 
 
 def test_view_file_escape(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("view_file", {"path": "../secret.txt"}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "escapes" in observation.content
+    observation = execute_action(_executor(tmp_path), ViewFileAction(path="../secret.txt"))
+    assert observation.error is not None and observation.start_line == 0
 
 
 def test_str_replace_single(tmp_path):
     executor = _executor(tmp_path)
-    observation = execute_action(executor,
-                                 ToolAction("str_replace", {"path": "a.py", "old": "return key",
-                                                            "new": "return key.upper()", "expected_occurrences": 1}, request_id="r1"), "e1")
-    assert observation.exit_code == 0
+    observation = execute_action(
+        executor,
+        StrReplaceAction(path="a.py", old_string="return key", new_string="return key.upper()"),
+    )
+    assert observation.success is True
     assert executor.read_text("a.py") == "def get_or_compute(key):\n    return key.upper()\n"
 
 
 def test_str_replace_zero(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("str_replace", {"path": "a.py", "old": "absent", "new": "x"}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "0 matches" in observation.content
+    observation = execute_action(
+        _executor(tmp_path),
+        StrReplaceAction(path="a.py", old_string="absent", new_string="x"),
+    )
+    assert observation.success is False
+    assert "not found" in observation.error
 
 
-def test_str_replace_multiple_ambiguous(tmp_path):
+def test_str_replace_not_unique(tmp_path):
     executor = _executor(tmp_path)
     executor.write_text("b.txt", "aaa")
-    observation = execute_action(executor,
-                                 ToolAction("str_replace", {"path": "b.txt", "old": "a", "new": "b"}, request_id="r1"), "e1")
-    assert observation.exit_code is None and "multiple matches" in observation.content
+    observation = execute_action(
+        executor, StrReplaceAction(path="b.txt", old_string="a", new_string="b")
+    )
+    assert observation.success is False
+    assert "not unique" in observation.error
 
 
-def test_str_replace_multiple_expected(tmp_path):
+def test_str_replace_empty_old_inserts_at_head(tmp_path):
     executor = _executor(tmp_path)
-    executor.write_text("b.txt", "aaa")
-    observation = execute_action(executor,
-                                 ToolAction("str_replace", {"path": "b.txt", "old": "a", "new": "b",
-                                                            "expected_occurrences": 3}, request_id="r1"), "e1")
-    assert observation.exit_code == 0 and executor.read_text("b.txt") == "bbb"
+    observation = execute_action(
+        executor, StrReplaceAction(path="a.py", old_string="", new_string="# header\n")
+    )
+    assert observation.success is True
+    assert executor.read_text("a.py").startswith("# header\n")
 
 
-def test_search_malformed_pattern(tmp_path):
-    observation = execute_action(_executor(tmp_path),
-                                 ToolAction("search", {"pattern": "[unclosed"}, request_id="r1"), "e1")
-    assert observation.exit_code is None and observation.content.startswith("ERROR:")
+def test_str_replace_empty_old_creates_file(tmp_path):
+    executor = _executor(tmp_path)
+    observation = execute_action(
+        executor, StrReplaceAction(path="new.txt", old_string="", new_string="hello")
+    )
+    assert observation.success is True
+    assert executor.read_text("new.txt") == "hello"
 
 
-class _FakeExecutor:
-    max_output_chars = 20_000
-    max_view_lines = 200
-    root = None
-    path_policy = None
-
-    def __init__(self):
-        self.calls = []
-
-    def search_text(self, pattern, path, max_results):
-        self.calls.append((pattern, path, max_results))
-        return ["a.py:1:first", "b.py:2:second"]
-
-
-def test_search_dispatches_through_executor():
-    fake = _FakeExecutor()
-    observation = execute_action(fake, ToolAction("search", {"pattern": "x"}, request_id="r1"), "e1")
-    assert observation.exit_code == 0
-    assert "a.py:1:first" in observation.content
-    assert fake.calls == [("x", ".", 50)]
+def test_str_replace_escape(tmp_path):
+    observation = execute_action(
+        _executor(tmp_path), StrReplaceAction(path="../secret.txt", old_string="x", new_string="y")
+    )
+    assert observation.success is False
+    assert observation.error is not None

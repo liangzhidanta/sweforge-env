@@ -1,16 +1,41 @@
-"""LocalDockerBackend — create/reset/execute/export_patch/verify/destroy for one env."""
+"""LocalDockerBackend — AutoDL EnvironmentBackend 的 Mac 侧实现（阶段 8 联调用）。
+
+create/reset/execute/export_patch/verify/destroy 语义与 vendored
+environment/mock.py 一致（五工具 canonical 观察渲染、finish 带 patch），
+区别仅在: 工作区通过 Executor 抽象隔离 —— LocalExecutor（本地临时目录, 无
+容器）或 DockerExecutor（每 env 一个非 root、无网络容器, image + seed）。
+
+Bundle 注册表: bundles_dir/<task_id>/ 下 task_manifest.json（canonical
+TaskSpec）+ repo/（初始仓库快照）+ private/hidden_tests/（F2P 隐藏测试,
+policy 不可见）。verify 时以 bundle 里的 task 为权威来源（P5: 调用方伪造的
+TaskSpec 不能削弱完整性）。
+"""
 
 from __future__ import annotations
 
 import json
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
 
-from sweforge.env_server.docker.executors import Executor, LocalExecutor
+from sweforge.environment.base import EnvironmentBackend
+from sweforge.env_server.docker.executors import DockerExecutor, Executor, LocalExecutor
 from sweforge.env_server.docker.tools import execute_action
-from sweforge.schemas import Observation, TaskSpec, ToolAction, VerificationResult
+from sweforge.env_server.docker.verify import verify_clean
+from sweforge.protocol.tools import FinishAction, ToolAction, ToolObservation
+from sweforge.schemas.task import TaskSpec
+from sweforge.schemas.verification import VerificationResult
+
+__all__ = [
+    "TaskBundle",
+    "EnvHandle",
+    "LocalDockerBackend",
+    "load_task_bundle",
+    "git_init_workspace",
+]
+
+_DEFAULT_SETUP_TIMEOUT = 120.0
 
 
 @dataclass
@@ -26,22 +51,13 @@ class EnvHandle:
     env_id: str
     task: TaskSpec
     executor: Executor
-    workspace: Path
+    finished: bool = False
     closed: bool = False
-
-
-class EnvironmentBackend(Protocol):
-    def create(self, task: TaskSpec) -> EnvHandle: ...
-    def reset(self, env: EnvHandle) -> str: ...
-    def execute(self, env: EnvHandle, action: ToolAction) -> Observation: ...
-    def export_patch(self, env: EnvHandle) -> str: ...
-    def verify(self, task: TaskSpec, patch: str) -> VerificationResult: ...
-    def destroy(self, env: EnvHandle) -> None: ...
 
 
 def load_task_bundle(bundle_dir: Path) -> TaskBundle:
     manifest = json.loads((bundle_dir / "task_manifest.json").read_text(encoding="utf-8"))
-    task = TaskSpec.from_dict(manifest["task"])
+    task = TaskSpec.model_validate(manifest["task"])
     repo_path = bundle_dir / "repo"
     hidden_tests = bundle_dir / "private" / "hidden_tests"
     if not repo_path.is_dir():
@@ -52,9 +68,8 @@ def load_task_bundle(bundle_dir: Path) -> TaskBundle:
     )
 
 
-def _git_init_workspace(executor: Executor) -> None:
-    # Keep generated artifacts out of the git baseline so export_patch never
-    # emits binary entries that git apply cannot reapply on the fresh verify copy.
+def git_init_workspace(executor: Executor) -> None:
+    """Commit a baseline after setup so export_patch never emits setup artifacts."""
     executor.write_text(".gitignore", "__pycache__/\n*.pyc\n.pytest_cache/\n")
     executor.run_argv(("git", "init", "-q"), timeout=30)
     executor.run_argv(("git", "config", "user.email", "sweforge@localhost"), timeout=10)
@@ -63,147 +78,136 @@ def _git_init_workspace(executor: Executor) -> None:
     executor.run_argv(("git", "commit", "-q", "-m", "baseline"), timeout=60)
 
 
-def _patch_paths(patch: str) -> list[str]:
-    paths: list[str] = []
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            if len(parts) >= 4 and parts[2].startswith("a/"):
-                paths.append(parts[2][2:])
-        elif line.startswith("--- a/"):
-            paths.append(line[6:])
-    return paths
+class LocalDockerBackend(EnvironmentBackend):
+    """AutoDL EnvironmentBackend on Mac: LocalExecutor (dev) or DockerExecutor.
 
+    bundles_dir: task bundle registry (see module docstring). use_docker=True
+    requires a running Docker daemon and the base image (see Dockerfile).
+    """
 
-def _check_integrity(patch: str, protected_paths: Sequence[str], max_patch_chars: int = 200_000) -> tuple[bool, str]:
-    if len(patch) > max_patch_chars:
-        return False, f"patch too large ({len(patch)} > {max_patch_chars})"
-    for path in _patch_paths(patch):
-        for protected in protected_paths:
-            protected = protected.strip("/")
-            if path == protected or path.startswith(protected + "/"):
-                return False, f"patch touches protected path: {path}"
-    return True, "ok"
-
-
-def _inject_hidden_tests(fresh: LocalExecutor, hidden_tests: Path) -> None:
-    if not hidden_tests.is_dir():
-        return
-    for source in sorted(hidden_tests.rglob("*.py")):
-        relative = source.relative_to(hidden_tests).as_posix()
-        fresh.write_text(relative, source.read_text(encoding="utf-8"))
-
-
-def _run_tests(executor: Executor, test_command: Sequence[str], test_ids: Sequence[str],
-               timeout: float = 120.0) -> tuple[dict[str, bool], bool]:
-    outcomes: dict[str, bool] = {}
-    timed_out = False
-    for test_id in test_ids:
-        result = executor.run_argv((*test_command, test_id), timeout=timeout)
-        outcomes[test_id] = result.exit_code == 0 and not result.timed_out
-        timed_out = timed_out or result.timed_out
-    return outcomes, timed_out
-
-
-def _verify_clean(fresh: LocalExecutor, bundle: TaskBundle, patch: str) -> VerificationResult:
-    # The manifest task is authoritative for verification: the caller only locates
-    # the bundle by task_id, so a spoofed caller TaskSpec cannot weaken integrity.
-    task = bundle.task
-    _git_init_workspace(fresh)
-    protected = (*task.protected_paths, *bundle.integrity_protected)
-    integrity_ok, integrity_reason = _check_integrity(patch, protected)
-    apply_result = None
-    f2p_timeout = False
-    p2p_timeout = False
-    if integrity_ok:
-        apply_result = fresh.run_argv(("git", "apply", "--allow-empty", "--whitespace=nowarn", "-"),
-                                      timeout=30, input_text=patch)
-        if apply_result.exit_code != 0:
-            integrity_ok = False
-            reason = apply_result.stderr.strip()
-            integrity_reason = f"git apply failed: {reason}" if reason else "git apply failed"
-    if integrity_ok:
-        try:
-            _inject_hidden_tests(fresh, bundle.hidden_tests)
-        except OSError as error:
-            integrity_ok = False
-            integrity_reason = f"failed to inject hidden tests: {error}"
-    if not integrity_ok:
-        f2p_outcomes = {test_id: False for test_id in task.fail_to_pass}
-        p2p_outcomes = {test_id: False for test_id in task.pass_to_pass}
-    else:
-        f2p_outcomes, f2p_timeout = _run_tests(fresh, task.test_command, task.fail_to_pass)
-        p2p_outcomes, p2p_timeout = _run_tests(fresh, task.test_command, task.pass_to_pass)
-    timed_out = bool(apply_result and apply_result.timed_out) or f2p_timeout or p2p_timeout
-    f2p_passed = sum(1 for ok in f2p_outcomes.values() if ok)
-    f2p_total = len(f2p_outcomes)
-    f2p_ratio = f2p_passed / f2p_total if f2p_total else 1.0
-    p2p_passed = sum(1 for ok in p2p_outcomes.values() if ok)
-    p2p_total = len(p2p_outcomes)
-    p2p_ratio = p2p_passed / p2p_total if p2p_total else 1.0
-    resolved = integrity_ok and f2p_ratio == 1.0 and p2p_ratio == 1.0 and not timed_out
-    p2p_failure_rate = 0.0 if p2p_total == 0 else 1.0 - p2p_ratio
-    reward = f2p_ratio - 0.3 * p2p_failure_rate + (0.2 if resolved else 0.0)
-    return VerificationResult(
-        f2p_passed=f2p_passed, f2p_total=f2p_total, f2p_ratio=f2p_ratio,
-        p2p_passed=p2p_passed, p2p_total=p2p_total, p2p_ratio=p2p_ratio,
-        integrity_ok=integrity_ok, resolved=resolved, reward=round(reward, 4), timeout=timed_out,
-        details={"integrity": integrity_reason, "f2p": dict(f2p_outcomes), "p2p": dict(p2p_outcomes)},
-    )
-
-
-class LocalDockerBackend:
-    def __init__(self, bundles_dir: Path, use_docker: bool = False) -> None:
+    def __init__(
+        self,
+        bundles_dir: str | Path,
+        use_docker: bool = False,
+        image: str = "sweforge-base",
+        docker_binary: str = "docker",
+        max_output_chars: int = 20_000,
+        max_view_lines: int = 200,
+        setup_timeout: float = _DEFAULT_SETUP_TIMEOUT,
+    ) -> None:
         self.bundles_dir = Path(bundles_dir)
         self.use_docker = use_docker
+        self.image = image
+        self.docker_binary = docker_binary
+        self.max_output_chars = max_output_chars
+        self.max_view_lines = max_view_lines
+        self.setup_timeout = setup_timeout
+        # 无 bundle 注册的任务: 空快照 + setup_commands 自建环境（AutoDL Mock 语义）
+        self._empty_snapshot = Path(tempfile.mkdtemp(prefix="sweforge-empty-snapshot-"))
 
-    def _make_executor(self, task: TaskSpec) -> Executor:
-        return self._executor_from_bundle(load_task_bundle(self.bundles_dir / task.task_id))
+    # ------------------------- executor 构造 -------------------------
 
-    def _executor_from_bundle(self, bundle: TaskBundle) -> Executor:
+    def _make_executor(self, bundle: TaskBundle, role: str) -> Executor:
+        """Fresh executor whose root holds the bundle repo snapshot (no hidden tests)."""
         if self.use_docker:
-            raise NotImplementedError("DockerExecutor wiring lands in M2")
-        executor = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=bundle.task.protected_paths)
-        _git_init_workspace(executor)
-        return executor
+            docker = DockerExecutor(
+                image=self.image,
+                container_name=f"sweforge-{role}-{bundle.task.task_id[:12]}-{uuid.uuid4().hex[:8]}",
+                task_id=bundle.task.task_id,
+                env_id=bundle.task.task_id,
+                docker_binary=self.docker_binary,
+                max_output_chars=self.max_output_chars,
+                max_view_lines=self.max_view_lines,
+            )
+            docker.seed_from_snapshot(bundle.repo_path)
+            return docker
+        return LocalExecutor.from_snapshot(
+            bundle.repo_path,
+            max_output_chars=self.max_output_chars,
+            max_view_lines=self.max_view_lines,
+        )
+
+    def _bundle(self, task: TaskSpec) -> TaskBundle:
+        """Bundle registry lookup, falling back to AutoDL Mock semantics.
+
+        Registered tasks return the authoritative bundle (task + repo snapshot +
+        hidden tests). Unregistered tasks run setup-driven: an empty snapshot
+        workspace that setup_commands populate, no hidden tests — matching how
+        AutoDL's mock backend creates an environment from a bare TaskSpec.
+        """
+        bundle_dir = self.bundles_dir / task.task_id
+        if (bundle_dir / "task_manifest.json").is_file():
+            return load_task_bundle(bundle_dir)
+        return TaskBundle(
+            task=task,
+            repo_path=self._empty_snapshot,
+            hidden_tests=self._empty_snapshot / ".no-hidden-tests",
+            integrity_protected=(),
+        )
+
+    def _protected_paths(self, bundle: TaskBundle) -> tuple[str, ...]:
+        hidden = (
+            tuple(p.relative_to(bundle.hidden_tests).as_posix() for p in bundle.hidden_tests.rglob("*.py"))
+            if bundle.hidden_tests.is_dir()
+            else ()
+        )
+        return (".git", *hidden, *bundle.integrity_protected)
+
+    # ------------------------- EnvironmentBackend -------------------------
 
     def create(self, task: TaskSpec) -> EnvHandle:
-        bundle = load_task_bundle(self.bundles_dir / task.task_id)
-        executor = self._executor_from_bundle(bundle)
-        return EnvHandle(env_id=uuid.uuid4().hex[:12], task=bundle.task,
-                         executor=executor, workspace=executor.root)
+        bundle = self._bundle(task)
+        executor = self._make_executor(bundle, "task")
+        for cmd in bundle.task.environment.setup_commands:
+            executor.run_shell(cmd, timeout=self.setup_timeout)
+        git_init_workspace(executor)
+        return EnvHandle(env_id=task.task_id, task=bundle.task, executor=executor)
 
-    def reset(self, env: EnvHandle) -> str:
-        env.executor.close()
-        env.executor = self._make_executor(env.task)
-        env.workspace = env.executor.root
-        env.closed = False
-        return env.task.problem_statement
-
-    def execute(self, env: EnvHandle, action: ToolAction) -> Observation:
+    def reset(self, env: EnvHandle) -> None:
+        """丢弃 agent 所有修改, 恢复到 create 后初始状态（setup 后基线）。"""
         if env.closed:
-            raise RuntimeError("env is destroyed")
-        return execute_action(env.executor, action, env.env_id)
+            raise RuntimeError(f"env {env.env_id} already destroyed")
+        env.executor.close()
+        bundle = self._bundle(env.task)
+        env.executor = self._make_executor(bundle, "task")
+        for cmd in bundle.task.environment.setup_commands:
+            env.executor.run_shell(cmd, timeout=self.setup_timeout)
+        git_init_workspace(env.executor)
+        env.finished = False
+
+    def execute(self, env: EnvHandle, action: ToolAction) -> ToolObservation:
+        if env.closed:
+            raise RuntimeError(f"env {env.env_id} already destroyed")
+        observation = execute_action(env.executor, action, export_patch=lambda: self.export_patch(env))
+        if isinstance(action, FinishAction):
+            env.finished = True
+        return observation
 
     def export_patch(self, env: EnvHandle) -> str:
+        """当前工作区相对 setup 后基线的 unified diff（git apply 可消费）。"""
         if env.closed:
-            raise RuntimeError("env is destroyed")
+            raise RuntimeError(f"env {env.env_id} already destroyed")
         env.executor.run_argv(("git", "add", "-N", "."), timeout=30)
         result = env.executor.run_argv(("git", "diff", "--no-ext-diff", "--", "."), timeout=30)
         if result.timed_out:
             raise TimeoutError("git diff timed out")
         return result.stdout
 
+    def verify(self, task: TaskSpec, patch: str) -> VerificationResult:
+        """clean-container verify（P4）: bundle 为权威来源, 隔离环境应用 patch。"""
+        bundle = self._bundle(task)
+        protected = self._protected_paths(bundle)
+        return verify_clean(
+            bundle.task,
+            patch,
+            make_executor=lambda: self._make_executor(bundle, "verify"),
+            hidden_tests=bundle.hidden_tests if bundle.hidden_tests.is_dir() else None,
+            protected_paths=protected,
+            metadata_extra={"backend": "local-docker", "docker": self.use_docker},
+        )
+
     def destroy(self, env: EnvHandle) -> None:
         if env.closed:
             return
         env.executor.close()
         env.closed = True
-
-    def verify(self, task: TaskSpec, patch: str) -> VerificationResult:
-        bundle = load_task_bundle(self.bundles_dir / task.task_id)
-        fresh = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=bundle.task.protected_paths)
-        try:
-            return _verify_clean(fresh, bundle, patch)
-        finally:
-            fresh.close()
