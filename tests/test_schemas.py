@@ -1,3 +1,5 @@
+import json
+
 from sweforge.schemas import AgentTrajectory, Observation, TaskSpec, ToolAction, TrajectoryStep
 
 
@@ -11,6 +13,20 @@ def test_task_spec_round_trip():
         fail_to_pass=("tests.test_f2p.F2PTest.test_x",),
     )
     assert TaskSpec.from_dict(spec.to_dict()) == spec
+
+
+def test_task_spec_from_dict_accepts_json_lists():
+    spec = TaskSpec(
+        task_id="t1",
+        repo="r",
+        base_commit="b",
+        problem_statement="p",
+        test_command=("python", "-m", "unittest"),
+        fail_to_pass=("tests.test_f2p.F2PTest.test_x",),
+    )
+    parsed = TaskSpec.from_dict(json.loads(json.dumps(spec.to_dict())))
+    assert parsed == spec
+    assert isinstance(parsed.test_command, tuple)
 
 
 def test_observation_to_dict_has_spec_fields():
