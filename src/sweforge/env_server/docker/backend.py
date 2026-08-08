@@ -107,11 +107,20 @@ class LocalDockerBackend(EnvironmentBackend):
 
     # ------------------------- executor 构造 -------------------------
 
+    def _resolve_image(self, task: TaskSpec) -> str:
+        """task.environment.image 优先, 否则 backend 默认镜像。
+
+        AutoDL 任务可引用预装依赖的自定义镜像: 容器 --network none, setup/
+        build/test 阶段无法联网 pip install, 依赖必须预先打进镜像。默认镜像
+        sweforge-base 只带 git+pytest, 适合自包含纯 Python 任务。
+        """
+        return task.environment.image or self.image
+
     def _make_executor(self, bundle: TaskBundle, role: str) -> Executor:
         """Fresh executor whose root holds the bundle repo snapshot (no hidden tests)."""
         if self.use_docker:
             docker = DockerExecutor(
-                image=self.image,
+                image=self._resolve_image(bundle.task),
                 container_name=f"sweforge-{role}-{bundle.task.task_id[:12]}-{uuid.uuid4().hex[:8]}",
                 task_id=bundle.task.task_id,
                 env_id=bundle.task.task_id,

@@ -146,6 +146,6 @@ M1 的 integrity 实现最小集：protected path 哈希比对 + patch 内路径
 
 ## 8. Out of Scope (M2+)
 
-已落地（见顶部 status update 与 `USAGE.txt`）：FastAPI `/v1` 路由（vendored `make_app` + `env_server/server.py`）、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路通过）、DockerExecutor stale cleanup（`manager.cleanup_stale_containers` + server `--cleanup-stale SECONDS`）。
+已落地（见顶部 status update 与 `USAGE.txt`）：FastAPI `/v1` 路由（vendored `make_app` + `env_server/server.py`）、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路通过）、DockerExecutor stale cleanup（`manager.cleanup_stale_containers` + server `--cleanup-stale SECONDS`）、Bearer auth（server `--token`/`SWEFORGE_TOKEN` + `env_server/client.py` 参考实现，AutoDL 客户端加一行请求头即接入）、per-task 镜像解析（`task.environment.image` 优先于默认镜像）。
 
-仍属 M2+：Bearer auth、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、SSH reverse tunnel 真机建立、AutoDL 跨机 host 真机对接（`validate_trajectory()` 已在本地 E2E 验证）。
+仍属 M2+：Task Registry（Mac 私有 secrets，当前 bundles_dir 即简化注册表）、Clean Verifier 服务化（已作为 `/v1/verifications` 端点）、SSH reverse tunnel 真机建立、AutoDL 跨机 host 真机对接（`validate_trajectory()` 已在本地 E2E 验证）。

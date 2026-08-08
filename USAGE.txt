@@ -1,170 +1,225 @@
 =====================================================================
- SWE-Forge Env Server — 使用说明
+ SWE-Forge Env Server — 使用说明（含两端联调教程）
  项目: sweforge-env   (Mac 侧执行环境, §8 契约 v1)
 =====================================================================
 
-【1. 这个项目是什么】
-    这是 SWE-Forge 的 Mac 侧"任务执行环境"。Agent 在代码仓库里做修复，
-    我们提供一套"环境"让它干活：
-      - 给 Agent 一个干净的代码工作区 (env)
-      - 提供 canonical 五工具: bash / search / view_file / str_replace / finish
-      - 把 Agent 的改动导出成 git 补丁 (export_patch)
-      - 在"全新工作区"上干净验证 (verify): 注入隐藏测试，跑 F2P / P2P，
-        产出 VerificationResult（verdict / integrity_ok / reward 等）
-
-    执行后端（Executor 抽象）:
-      - LocalExecutor  默认，直接在临时目录跑，不需要 Docker（dev/CI）
-      - DockerExecutor 每 env 一个非 root、无网络容器（真实隔离，需 colima/Docker）
-    协议/接口与 AutoDL 逐字节一致（VENDORED.md），两端可无缝联调。
+【1. 能不能支撑 AutoDL 的 Docker 需求? —— 能, 现状说明】
+    Mac 侧已实现完整的 §8 契约执行环境, 并已用真实 Docker 容器端到端跑通:
+      * server 起后, AutoDL 客户端（RemoteEnvironmentBackend）经 SSH tunnel
+        打到 Mac server -> LocalDockerBackend -> 每 env 一个隔离容器
+      * 五工具、git patch、clean verify（注入隐藏测试）全链路在容器内执行
+      * AutoDL 任务可用 `environment.image` 指定预装依赖的镜像
+        （容器 --network none, setup/build/test 无法联网 pip install,
+        依赖必须预先打进镜像; 不指定则用默认 sweforge-base, 只带 git+pytest）
+      * 可选 `--token` Bearer 认证, 隧道暴露时防未授权访问
+    已实测: interop_mac.py 全链路 exit 0（local + docker 双后端）;
+    demo_rollout --docker -> verdict=resolved reward=1.0。
 
 【2. 环境要求】
-    - macOS (arm64 / Apple Silicon)，Python >= 3.11（本机用 base conda env,
-      /opt/homebrew/Caskroom/miniconda/base，Python 3.12；wsh 是 3.8 不兼容）
+    - macOS (arm64 / Apple Silicon)，Python >= 3.11（本机 base conda env,
+      /opt/homebrew/Caskroom/miniconda/base, Python 3.12; wsh 是 3.8 不兼容）
     - Docker 可选: 本机经 colima 装好（`docker info` 可用即 OK）。
-      colima 是 VM 方案，daemon 出网走宿主机代理: 配置见【9】。
+      colima 是 VM 方案, daemon 出网走宿主机代理（配置见【9】）。
     - 宿主 Clash 代理会拦 127.0.0.1 -> 本机内网 HTTP 都要加
-      NO_PROXY=127.0.0.1,localhost（服务器/客户端/测试均如此）。
+      NO_PROXY=127.0.0.1,localhost（服务器 / 客户端 / 测试均如此）。
+    - 无需 pip install（包未做 editable 安装）: 测试走 pyproject 的
+      pythonpath, 脚本/服务器用 PYTHONPATH=src 前缀。
 
-【3. 安装】
-    本项目无需 pip install（包未做 editable 安装）:
-      - 测试: 在项目根目录直接 `python -m pytest`（pyproject 里
-        pythonpath=["src"] 已配好）
-      - 脚本/服务器: `PYTHONPATH=src python ...`
-    依赖（pydantic/httpx/fastapi/uvicorn/pytest/ruff）已在 base env。
+【3. Mac 侧命令速查表（每条对应什么功能、参数）】
+    ---------------------------------------------------------------
+    命令                                功能
+    ---------------------------------------------------------------
+    docker build -t sweforge-base       建默认基础镜像（python:3.11-slim +
+    src/sweforge/env_server/docker/      git + pytest + 非 root uid1000）
+    ---------------------------------------------------------------
+    PYTHONPATH=src python                起 Environment Server（默认
+    -m sweforge.env_server.server        只监听 127.0.0.1, 端口 8500）
+    ---------------------------------------------------------------
+    examples/demo_rollout.py             端到端演示: 建 env -> 看源码 ->
+      [--docker]                         定位 bug -> 修复 -> 导出 patch ->
+                                         干净验证（F2P/P2P/integrity/reward）
+    ---------------------------------------------------------------
+    python -m pytest -q                  全部测试（预期 157 passed）
+    python -m ruff check src tests        代码风格检查
+    ---------------------------------------------------------------
 
-【4. 跑测试】
-    全部测试:
+    server 的全部参数:
+      --bundles-dir DIR   task bundle 注册表根目录（含 <task_id>/task_manifest.json
+                          + repo/ 快照 + private/hidden_tests/）。未登记的 task
+                          走 setup-command 自建工作区（AutoDL Mock 语义）。
+      --docker            用 DockerExecutor（每 env 一个非 root、--network none
+                          容器）。默认 LocalExecutor（临时目录, 无需 Docker）。
+      --image IMG         默认镜像回退值（task 未指定 environment.image 时用）,
+                          默认 sweforge-base。
+      --port PORT         监听端口, 默认 8500。
+      --cleanup-stale SEC 启动前清掉创建时间早于 SEC 秒的 sweforge-managed
+                          泄漏容器（上一轮 server 崩溃未 destroy 的; 按 age
+                          过滤, 不误杀刚创建的活跃容器）。
+      --token SECRET      可选 Bearer 认证 token（隧道暴露时防未授权）。
+                          缺省读环境变量 SWEFORGE_TOKEN; 都未设则不加认证,
+                          与 AutoDL 契约客户端原样互通。
+      --host HOST         绑定地址, 默认 127.0.0.1（不要改成 0.0.0.0,
+                          公网访问一律走 SSH tunnel）。
 
-        NO_PROXY=127.0.0.1,localhost python -m pytest -q
+    实用示例:
+      # 本地/开发（无 Docker）
+      NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+        python -m sweforge.env_server.server --bundles-dir examples
 
-    预期输出: 150 passed（含 vendored AutoDL 契约测试 + Docker 集成测试）。
-    跑指定文件:
+      # 正式 Docker + 认证 + 泄漏清理
+      NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+        python -m sweforge.env_server.server --bundles-dir examples \
+          --docker --token $(python -c "import secrets; print(secrets.token_hex(16))") \
+          --cleanup-stale 3600 --port 8500
 
-        python -m pytest tests/test_backend.py -v
+【4. 两端怎么连上（AutoDL <-> Mac, 逐步操作）】
+    拓扑: AutoDL Agent -> RemoteEnvironmentBackend -> HTTP -> SSH tunnel
+          -> Mac server（只监听 127.0.0.1）-> Docker 容器
 
-    代码风格检查 (ruff):
+    前提: Mac 能被 AutoDL 主机访问到（公网 IP 或可达内网地址）+ Mac 开启
+    远程登录（SSH）。Mac 侧先跑起来 server（见【3】）, 再建隧道。
 
-        python -m ruff check src tests examples
-        预期: All checks passed!
+    ===== A. Mac 侧（先做）=====
+      1. 建好依赖镜像（如需 Docker）:
+           docker build -t sweforge-base src/sweforge/env_server/docker/
+      2. 起 server（示例带 token + 清理 + Docker）:
+           NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+             python -m sweforge.env_server.server --bundles-dir examples \
+               --docker --token <SECRET> --port 8500
+      3. 自检（本机）:
+           curl http://127.0.0.1:8500/health        -> {"ok":true}
+           加认证后 /v1 需带 token:
+           curl -H "Authorization: Bearer <SECRET>" \
+             -X POST http://127.0.0.1:8500/v1/envs -H 'Content-Type: application/json' \
+             -d '{"task_id":"...","request_id":"..."}'
+      4. 告诉 AutoDL 侧: Mac 的 IP + SSH 用户名 + server 端口 + token（若开）。
 
-【5. 运行演示】
-    a) 本地执行器（无需 Docker）:
+    ===== B. AutoDL 侧（后做, 需能 ssh 到 Mac）=====
+      1. 建 SSH 隧道（把 Mac 的 127.0.0.1:8500 转发到本机 8500）:
+           ssh -L 8500:127.0.0.1:8500 <user>@<mac-ip>
+         （保持该终端挂着; 之后本机 127.0.0.1:8500 即 Mac server）
+      2. 联调脚本（脚本在 AutoDL 侧源码里）:
+           python scripts/interop_mac.py --base-url http://127.0.0.1:8500
+         退出码 0 = 全链路通过（health -> register -> create -> 五工具 ->
+         export_patch -> verify -> AgentLoop + validate_trajectory）。
+      3. 若 Mac server 开了 --token, AutoDL 客户端要加认证头 ——
+         AutoDL 侧 sweforge/environment/remote.py 的 _request() 里 headers
+         加一行（其余不动）:
+           headers={"Content-Type": "application/json",
+                    "Authorization": f"Bearer {TOKEN}"}
+         Mac 侧已有参考实现（env_server/client.py 的
+         AuthenticatedRemoteEnvironmentBackend）, 本地联调可直接用它。
 
-        NO_PROXY=127.0.0.1,localhost PYTHONPATH=src python examples/demo_rollout.py
+    本机自测（不 ssh, 同一份 AutoDL 客户端打本地 server）:
+      NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+        python /tmp/autodl/scripts/interop_mac.py --base-url http://127.0.0.1:8500
 
-    b) 真实 Docker 容器（需 daemon + sweforge-base 镜像，见【9】）:
-
-        PYTHONPATH=src python examples/demo_rollout.py --docker
-
+【5. 端到端演示（本机, 推荐先做）】
+    NO_PROXY=127.0.0.1,localhost PYTHONPATH=src python examples/demo_rollout.py
+    （Docker 版加 --docker）
     关键输出:
       [4] 空补丁验证 buggy 版本:   F2P=0/1  P2P=2/2  -> bug 存在且被 F2P 抓到
       [7] 修复后干净验证:         F2P=1/1  P2P=2/2  verdict=resolved
                                  integrity_ok=True  reward=1.0
 
-【6. 起 Environment Server（§8 契约 v1）】
-    Mac 侧入口（vendor 的 make_app 包 LocalDockerBackend，只监听 127.0.0.1）:
+【6. 测试 / 风格】
+    NO_PROXY=127.0.0.1,localhost python -m pytest -q      # 157 passed
+    python -m pytest tests/test_backend.py -v             # 指定文件
+    python -m ruff check src tests examples               # All checks passed!
 
-        NO_PROXY=127.0.0.1,localhost \
-        PYTHONPATH=src python -m sweforge.env_server.server \
-          --bundles-dir examples [--docker] [--port 8500] [--cleanup-stale 3600]
+【7. §8 契约端点（vendored make_app, 不变更）】
+    GET    /health                    # 存活检查（不加认证也通）
+    POST   /v1/tasks/register         # 登记 TaskSpec（server 持有）
+    POST   /v1/envs                   # create: 内联 {"task"} 或引用 {"task_id"}
+    POST   /v1/envs/{env_id}/reset
+    POST   /v1/envs/{env_id}/actions  # execute(action) -> observation
+    GET    /v1/envs/{env_id}/patch    # export_patch
+    DELETE /v1/envs/{env_id}          # request_id 放 query
+    POST   /v1/verifications          # clean-container verify(task, patch)
+    所有修改状态请求携带 request_id -> server 幂等表去重（vendored 自带）。
 
-    - --bundles-dir: task bundle 注册表根目录（<task_id>/task_manifest.json）
-    - 未登记的 task 走 setup-command 自建工作区（AutoDL Mock 语义）
-    - --cleanup-stale SECONDS: 启动前清掉创建时间早于 SECONDS 秒的
-      sweforge-managed 泄漏容器（上一轮 server 崩溃未 destroy 的; 按 age
-      过滤, 不误杀刚创建的活跃容器）
-    - 端点: GET /health, POST /v1/tasks/register, POST /v1/envs,
-      POST /v1/envs/{id}/reset, POST /v1/envs/{id}/actions,
-      GET  /v1/envs/{id}/patch, DELETE /v1/envs/{id}, POST /v1/verifications
-
-【7. 与 AutoDL 联调（interop_mac.py）】
-    拓扑（AutoDL 侧 Agent -> RemoteEnvironmentBackend -> SSH tunnel -> Mac
-    server（只监听 127.0.0.1）-> Docker）:
-
-        1. Mac 侧先起 server（见【6】）
-        2. 建 SSH 隧道（AutoDL 侧执行）:
-             ssh -L 8500:127.0.0.1:8500 user@mac
-        3. AutoDL 侧跑联调脚本:
-             python scripts/interop_mac.py --base-url http://127.0.0.1:8500
-
-    退出码 0 = 全链路通过（health -> register -> create -> 五工具 ->
-    export_patch -> verify -> AgentLoop + validate_trajectory）。
-    本机自测（不 ssh，直接用同一份 AutoDL 客户端打本地 server）:
-        NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
-        python /tmp/autodl/scripts/interop_mac.py --base-url http://127.0.0.1:8500
-
-【8. 常用 API（对接 AutoDL / 写自己的脚本）】
-    协议是 AutoDL canonical（pydantic v2, discriminated union; 不是老的
-    dict 风格 ToolAction）:
-
+【8. 常用 API（Mac 侧直接调 backend, 写脚本/测试用）】
+    协议是 AutoDL canonical（pydantic v2, 五工具 discriminated union）:
         from sweforge.env_server.docker.backend import LocalDockerBackend, load_task_bundle
         from sweforge.protocol.tools import ViewFileAction, StrReplaceAction
 
         task    = load_task_bundle(Path("examples/toy_cache_aliasing")).task
-        backend = LocalDockerBackend(Path("examples"))   # bundles_dir = task_id 目录的父级
-        env     = backend.create(task)                    # 建一个干净工作区
-        backend.reset(env)                                # 丢弃改动回到 setup 后基线 (返回 None)
+        backend = LocalDockerBackend(Path("examples"), use_docker=True)
+        env     = backend.create(task)
         obs     = backend.execute(env, ViewFileAction(path="toy_cache/cache.py",
                                                       start_line=1, end_line=20))
-        obs     = backend.execute(env, StrReplaceAction(path="toy_cache/cache.py",
-                                                        old_string=..., new_string=...))
-        patch   = backend.export_patch(env)               # Agent 改完导出 git diff
-        result  = backend.verify(task, patch)             # 全新工作区干净验证
-        backend.destroy(env)                              # 销毁，清理临时目录
-
+        patch   = backend.export_patch(env)
+        result  = backend.verify(task, patch)   # 全新工作区干净验证
+        backend.destroy(env)
     五工具: BashAction / SearchAction / ViewFileAction / StrReplaceAction /
-    FinishAction。VerificationResult 字段: verdict(resolved/unresolved/error),
+    FinishAction。VerificationResult: verdict(resolved/unresolved/error),
     fail_to_pass/pass_to_pass(TestResult 列表), f2p_passed/p2p_passed,
     integrity_ok, reward, metadata。
 
-【9. Docker（colima）与基础镜像】
+【9. Docker（colima）与镜像】
     本机 colima VM（aarch64, Ubuntu 24.04, runtime=docker）已配好:
       - VM 内 DNS 修正为 192.168.5.3（colima.yaml dns + provision 脚本）
       - daemon 出网走宿主机代理 192.168.5.2:7897（systemd drop-in）
-    构建基础镜像（Python 3.11 + git + pytest, 非 root uid 1000 用户）:
-
+    构建基础镜像:
         docker build -t sweforge-base src/sweforge/env_server/docker/
-
-    之后 demo/server 加 --docker 即用容器执行。镜像含 pytest 且 /workspace
-    归 uid 1000；DockerExecutor 以 tar+docker cp 注入仓库快照。
+    DockerExecutor 以 tar+docker cp 注入仓库快照; 容器 --user 1000:1000、
+    --network none、CPU/内存/PID 限制, 打 sweforge.managed 标签
+    （manager.cleanup_stale_containers 据此清理泄漏容器）。
+    自定义任务镜像: AutoDL 任务在 TaskSpec.environment.image 填镜像名即可,
+    Mac server 解析优先用该镜像（需 daemon 能拉取, 见 colima 代理配置）。
 
 【10. 目录结构】
     src/sweforge/
       schemas/ protocol/ environment/ reward/ agent/  # AutoDL canonical 契约 (verbatim, 勿改)
       env_server/
+        server.py          # Mac server CLI（vendored make_app + auth + LocalDockerBackend）
+        client.py          # AuthenticatedRemoteEnvironmentBackend（Mac 侧参考实现）
         docker/
-          path_policy.py     # 路径安全: 拒绝越界/symlink/保护路径
-          manager.py         # 容器 labels / 资源限制常量
-          executors.py       # Executor 抽象 + LocalExecutor + DockerExecutor
-          tools.py           # canonical 五工具观察渲染
-          verify.py          # clean verifier（全新工作区注入隐藏测试）
-          backend.py         # LocalDockerBackend: create/reset/execute/export_patch/verify/destroy
-          Dockerfile         # sweforge-base 基础镜像
-        server.py            # Mac server CLI: vendored make_app + LocalDockerBackend
+          path_policy.py   # 路径安全: 拒绝越界/symlink/保护路径
+          manager.py       # 容器 labels/limits + stale-container cleanup
+          executors.py     # Executor 抽象 + LocalExecutor + DockerExecutor
+          tools.py         # canonical 五工具观察渲染
+          verify.py        # clean verifier（全新工作区注入隐藏测试）
+          backend.py       # LocalDockerBackend（含 task.environment.image 解析）
+          Dockerfile       # sweforge-base 基础镜像
     examples/toy_cache_aliasing/  # 示例任务 bundle
-      repo/                  #   canonical buggy 快照（Agent 看到的东西 + 公开 P2P 测试）
-      private/hidden_tests/  #   Mac 私有的隐藏 F2P 测试
-      task_manifest.json     #   canonical TaskSpec
-    tests/                   # 含 vendored AutoDL 契约测试 + Mac 自有测试
+      repo/                  # canonical buggy 快照（Agent 可见 + 公开 P2P）
+      private/hidden_tests/  # Mac 私有的隐藏 F2P 测试
+      task_manifest.json     # canonical TaskSpec
+    tests/                   # vendored AutoDL 契约测试 + Mac 自有测试
 
 【11. 常见问题】
-    Q: 提示 ModuleNotFoundError: No module named 'sweforge'
-    A: 用 PYTHONPATH=src 前缀运行脚本/服务器；pytest 已配好不需要。
+    Q: ModuleNotFoundError: No module named 'sweforge'
+    A: 脚本/服务器加 PYTHONPATH=src 前缀; pytest 已配好不需要。
 
-    Q: 本机 HTTP 起 server 后 curl / 客户端连不上?
+    Q: 本机起 server 后 curl / 客户端连不上?
     A: 加 NO_PROXY=127.0.0.1,localhost（宿主导 Clash 代理拦本地流量）。
 
-    Q: 我没有 Docker，能用吗?
-    A: 能。默认就是 LocalExecutor。只有需要真实隔离时加 --docker。
-       要先 `docker build -t sweforge-base src/sweforge/env_server/docker/`。
+    Q: 没有 Docker 能用吗?
+    A: 能。默认 LocalExecutor; 需要真实隔离时加 --docker, 并先 build 镜像。
+
+    Q: 任务里 pip install 失败 / 没有网络?
+    A: 容器 --network none。依赖要打进任务镜像（environment.image）, 或
+       task bundle 的 setup_commands 用已安装的包; 默认镜像只有 git+pytest。
+
+    Q: 开了 --token 后 AutoDL 客户端 401?
+    A: AutoDL 侧 remote.py 的 _request headers 加
+       "Authorization": f"Bearer {TOKEN}"（见【4】）。Mac 侧参考实现用
+       env_server/client.py。
+
+    Q: 容器泄漏了怎么办?
+    A: server --cleanup-stale SECONDS 启动时清; 或
+       PYTHONPATH=src python -c "from sweforge.env_server.docker.manager
+       import cleanup_stale_containers; print(cleanup_stale_containers(
+       age_seconds=3600, dry_run=True))"（去掉 dry_run=True 真删）。
 
     Q: reset 之后旧 observation/工作区会怎样?
-    A: reset 丢弃 agent 所有修改，重建 executor 回到 setup 后基线，
-       返回 None（AutoDL 契约）；env_id 不变。
+    A: reset 丢弃 agent 所有修改, 重建 executor 回到 setup 后基线, 返回 None
+       （AutoDL 契约）; env_id 不变。
 
-    Q: 我换了一台机器 / 重新 clone，要做什么?
-    A: 配好 Python >=3.11 环境 + 依赖即可；examples/ 任务数据随仓库走。
-       要 Docker 的话另按【9】搭 colima + 建镜像。
+    Q: 换了一台机器 / 重新 clone?
+    A: 配好 Python >=3.11 + 依赖即可; examples/ 任务数据随仓库走。要 Docker
+       按【9】搭 colima + 建镜像。
 
 =====================================================================
  (完) 设计背景见 docs/superpowers/specs/2026-08-08-env-server-design.md

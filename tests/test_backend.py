@@ -117,6 +117,22 @@ def test_verify_hidden_test_path_collision_collapses_to_integrity_failure():
     assert "tests/test_f2p.py" in result.metadata["integrity_reason"]
 
 
+def test_resolve_image_task_overrides_default():
+    backend = LocalDockerBackend(EXAMPLES.parent, image="sweforge-base")
+    task = TaskSpec(
+        task_id="img-task",
+        repo="demo",
+        base_commit="0000000",
+        problem_statement="p",
+        environment=TaskEnvironment(image="my/rt-image:v1"),
+        fail_to_pass=[],
+        pass_to_pass=[],
+    )
+    assert backend._resolve_image(task) == "my/rt-image:v1"
+    assert backend._resolve_image(task.model_copy(update={"environment": task.environment.model_copy(
+        update={"image": None})})) == "sweforge-base"
+
+
 def test_bundle_less_task_setup_driven():
     """无 bundle 任务: setup_commands 自建工作区（AutoDL Mock 语义）。"""
     task = TaskSpec(
