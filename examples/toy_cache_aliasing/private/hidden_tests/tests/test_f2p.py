@@ -11,6 +11,6 @@ class F2PTest(unittest.TestCase):
             calls.append("compute")
             return 42
 
-        self.assertEqual(get_or_compute("k", compute), 42)
-        self.assertEqual(get_or_compute("k", compute), 42)
+        self.assertEqual(get_or_compute("f2p-unique-key", compute), 42)
+        self.assertEqual(get_or_compute("f2p-unique-key", compute), 42)
         self.assertEqual(calls, ["compute"])
