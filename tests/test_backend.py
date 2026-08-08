@@ -87,3 +87,42 @@ def test_verify_apply_failure_reports_reason():
     result = backend.verify(_task(), malformed)
     assert not result.integrity_ok
     assert "git apply failed" in result.details["integrity"]
+
+
+def test_verify_hidden_test_path_collision_collapses_to_integrity_failure():
+    backend = LocalDockerBackend(EXAMPLES.parent)
+    collision = ("diff --git a/tests/test_f2p.py/evil.txt b/tests/test_f2p.py/evil.txt\n"
+                 "new file mode 100644\n"
+                 "--- /dev/null\n"
+                 "+++ b/tests/test_f2p.py/evil.txt\n"
+                 "@@ -0,0 +1 @@\n"
+                 "+owned\n")
+    result = backend.verify(_task(), collision)
+    assert not result.integrity_ok
+    assert "hidden tests" in result.details["integrity"]
+
+
+def test_verify_uses_manifest_protected_paths_not_caller(tmp_path):
+    import json
+    import shutil
+    from dataclasses import replace
+
+    bundle_dir = tmp_path / "toy_cache_aliasing"
+    shutil.copytree(EXAMPLES, bundle_dir)
+    manifest_path = bundle_dir / "task_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["task"]["protected_paths"] = [".git", "secret.txt"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (bundle_dir / "repo" / "secret.txt").write_text("classified", encoding="utf-8")
+
+    task = load_task_bundle(bundle_dir).task
+    backend = LocalDockerBackend(tmp_path)
+    spoofed = replace(task, protected_paths=())
+    patch = ("diff --git a/secret.txt b/secret.txt\n"
+             "--- a/secret.txt\n+++ b/secret.txt\n"
+             "@@ -1 +1 @@\n"
+             "-classified\n"
+             "+owned\n")
+    result = backend.verify(spoofed, patch)
+    assert not result.integrity_ok
+    assert "secret.txt" in result.details["integrity"]

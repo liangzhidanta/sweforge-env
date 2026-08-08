@@ -105,7 +105,10 @@ def _run_tests(executor: Executor, test_command: Sequence[str], test_ids: Sequen
     return outcomes, timed_out
 
 
-def _verify_clean(fresh: LocalExecutor, task: TaskSpec, patch: str, bundle: TaskBundle) -> VerificationResult:
+def _verify_clean(fresh: LocalExecutor, bundle: TaskBundle, patch: str) -> VerificationResult:
+    # The manifest task is authoritative for verification: the caller only locates
+    # the bundle by task_id, so a spoofed caller TaskSpec cannot weaken integrity.
+    task = bundle.task
     _git_init_workspace(fresh)
     protected = (*task.protected_paths, *bundle.integrity_protected)
     integrity_ok, integrity_reason = _check_integrity(patch, protected)
@@ -120,7 +123,11 @@ def _verify_clean(fresh: LocalExecutor, task: TaskSpec, patch: str, bundle: Task
             reason = apply_result.stderr.strip()
             integrity_reason = f"git apply failed: {reason}" if reason else "git apply failed"
     if integrity_ok:
-        _inject_hidden_tests(fresh, bundle.hidden_tests)
+        try:
+            _inject_hidden_tests(fresh, bundle.hidden_tests)
+        except OSError as error:
+            integrity_ok = False
+            integrity_reason = f"failed to inject hidden tests: {error}"
     if not integrity_ok:
         f2p_outcomes = {test_id: False for test_id in task.fail_to_pass}
         p2p_outcomes = {test_id: False for test_id in task.pass_to_pass}
@@ -195,8 +202,8 @@ class LocalDockerBackend:
 
     def verify(self, task: TaskSpec, patch: str) -> VerificationResult:
         bundle = load_task_bundle(self.bundles_dir / task.task_id)
-        fresh = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=task.protected_paths)
+        fresh = LocalExecutor.from_snapshot(bundle.repo_path, protected_paths=bundle.task.protected_paths)
         try:
-            return _verify_clean(fresh, task, patch, bundle)
+            return _verify_clean(fresh, bundle, patch)
         finally:
             fresh.close()
