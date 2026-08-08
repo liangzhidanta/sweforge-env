@@ -21,5 +21,6 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff]
+src = ["src"]
 line-length = 100
 target-version = "py311"
