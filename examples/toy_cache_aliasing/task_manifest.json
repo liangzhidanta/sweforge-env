@@ -1,0 +1,18 @@
+{
+  "task": {
+    "task_id": "toy_cache_aliasing",
+    "repo": "toy_cache",
+    "base_commit": "buggy",
+    "problem_statement": "Fix the caching bug in toy_cache/cache.py. get_or_compute(key, compute) should cache each key's computed value so a repeated call for the same key returns the cached value without recomputing. The cache is currently indexed by the computed value instead of the key, so repeated calls for the same key recompute.",
+    "test_command": ["python", "-m", "unittest"],
+    "fail_to_pass": ["tests.test_f2p.F2PTest.test_repeated_key_does_not_recompute"],
+    "pass_to_pass": [
+      "tests.test_public.PublicTests.test_correct_value_returned",
+      "tests.test_public.PublicTests.test_repeat_returns_same_value"
+    ],
+    "protected_paths": [".git"],
+    "platform": "linux/arm64",
+    "metadata": {"source": "toy", "bug_class": "cache-indexed-by-value"}
+  },
+  "integrity_protected": []
+}
