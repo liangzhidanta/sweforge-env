@@ -84,7 +84,7 @@ src/sweforge/
 └── env_server/
     └── docker/
         ├── backend.py  # LocalDockerBackend + EnvironmentBackend 协议
-        └── manager.py  # (M1 骨架：labels、limits、stale cleanup 常量化；M2 填)
+        └── manager.py  # labels / limits + stale-container cleanup（list/cleanup，server --cleanup-stale）
 ```
 
 `EnvironmentBackend` 协议（§4）：
@@ -146,6 +146,6 @@ M1 的 integrity 实现最小集：protected path 哈希比对 + patch 内路径
 
 ## 8. Out of Scope (M2+)
 
-已落地（见顶部 status update 与 `USAGE.txt`）：FastAPI `/v1` 路由（vendored `make_app` + `env_server/server.py`）、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路通过）。
+已落地（见顶部 status update 与 `USAGE.txt`）：FastAPI `/v1` 路由（vendored `make_app` + `env_server/server.py`）、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路通过）、DockerExecutor stale cleanup（`manager.cleanup_stale_containers` + server `--cleanup-stale SECONDS`）。
 
-仍属 M2+：Bearer auth、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、DockerExecutor stale cleanup、SSH reverse tunnel 真机建立、AutoDL 跨机 host 真机对接（`validate_trajectory()` 已在本地 E2E 验证）。
+仍属 M2+：Bearer auth、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、SSH reverse tunnel 真机建立、AutoDL 跨机 host 真机对接（`validate_trajectory()` 已在本地 E2E 验证）。

@@ -66,10 +66,13 @@
 
         NO_PROXY=127.0.0.1,localhost \
         PYTHONPATH=src python -m sweforge.env_server.server \
-          --bundles-dir examples [--docker] [--port 8500]
+          --bundles-dir examples [--docker] [--port 8500] [--cleanup-stale 3600]
 
     - --bundles-dir: task bundle 注册表根目录（<task_id>/task_manifest.json）
     - 未登记的 task 走 setup-command 自建工作区（AutoDL Mock 语义）
+    - --cleanup-stale SECONDS: 启动前清掉创建时间早于 SECONDS 秒的
+      sweforge-managed 泄漏容器（上一轮 server 崩溃未 destroy 的; 按 age
+      过滤, 不误杀刚创建的活跃容器）
     - 端点: GET /health, POST /v1/tasks/register, POST /v1/envs,
       POST /v1/envs/{id}/reset, POST /v1/envs/{id}/actions,
       GET  /v1/envs/{id}/patch, DELETE /v1/envs/{id}, POST /v1/verifications

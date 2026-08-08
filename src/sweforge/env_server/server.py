@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from sweforge.env_server.docker.backend import LocalDockerBackend
+from sweforge.env_server.docker.manager import cleanup_stale_containers
 from sweforge.environment.server import make_app
 
 DEFAULT_PORT = 8500
@@ -44,9 +45,21 @@ def main(argv: list[str] | None = None) -> int:
         "默认 LocalExecutor（临时目录, 无需 Docker）",
     )
     parser.add_argument("--image", default="sweforge-base")
+    parser.add_argument(
+        "--cleanup-stale",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="启动前清掉创建时间早于 SECONDS 秒的 sweforge-managed 泄漏容器"
+        "（上一轮 server 崩溃未 destroy 的; 按 age 过滤, 不误杀活跃容器）",
+    )
     args = parser.parse_args(argv)
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     bundles_dir = Path(args.bundles_dir) if args.bundles_dir else Path(tempfile.mkdtemp(prefix="sweforge-bundles-"))
+    if args.cleanup_stale is not None:
+        removed = cleanup_stale_containers(age_seconds=args.cleanup_stale)
+        logger.info("cleanup_stale: removed %d leaked container(s)", len(removed))
     backend = LocalDockerBackend(bundles_dir=bundles_dir, use_docker=args.docker, image=args.image)
     logger.info(
         "Mac Environment Server: backend=%s bundles_dir=%s port=%s docker=%s",
