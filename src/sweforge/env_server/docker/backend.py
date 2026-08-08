@@ -53,6 +53,9 @@ def load_task_bundle(bundle_dir: Path) -> TaskBundle:
 
 
 def _git_init_workspace(executor: Executor) -> None:
+    # Keep generated artifacts out of the git baseline so export_patch never
+    # emits binary entries that git apply cannot reapply on the fresh verify copy.
+    executor.write_text(".gitignore", "__pycache__/\n*.pyc\n.pytest_cache/\n")
     executor.run_argv(("git", "init", "-q"), timeout=30)
     executor.run_argv(("git", "config", "user.email", "sweforge@localhost"), timeout=10)
     executor.run_argv(("git", "config", "user.name", "SWE-Forge"), timeout=10)
