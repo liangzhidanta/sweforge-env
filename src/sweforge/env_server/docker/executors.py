@@ -171,9 +171,12 @@ class DockerExecutor:
             raise RuntimeError(f"failed to start container: {completed.stderr.strip()}")
         self._started = True
 
-    def _exec(self, argv, timeout, input_text=None):
+    def _exec(self, argv, timeout, input_text=None, workdir=None, max_chars=None):
         self.start()
-        command = (self.docker_binary, "exec", "-i", self.container_name, *argv)
+        command = [self.docker_binary, "exec", "-i"]
+        if workdir:
+            command += ["--workdir", workdir]
+        command += [self.container_name, *argv]
         started = time.monotonic()
         try:
             completed = subprocess.run(command, input=input_text, capture_output=True,
@@ -181,23 +184,24 @@ class DockerExecutor:
         except subprocess.TimeoutExpired:
             return CommandResult(124, "", "command timed out",
                                  int((time.monotonic() - started) * 1000), timed_out=True)
-        stdout, stdout_cut = _truncate(completed.stdout, self.max_output_chars)
-        stderr, stderr_cut = _truncate(completed.stderr, self.max_output_chars)
+        limit = self.max_output_chars if max_chars is None else max_chars
+        stdout, stdout_cut = _truncate(completed.stdout, limit)
+        stderr, stderr_cut = _truncate(completed.stderr, limit)
         return CommandResult(completed.returncode, stdout, stderr,
                              int((time.monotonic() - started) * 1000),
                              truncated=stdout_cut or stderr_cut)
 
     def run_argv(self, argv, timeout=30.0, cwd=".", input_text=None):
         resolved_cwd = self.path_policy.resolve(cwd).as_posix()
-        return self._exec(("--workdir", resolved_cwd, *argv), timeout, input_text)
+        return self._exec(tuple(argv), timeout, input_text, workdir=resolved_cwd)
 
     def run_shell(self, command, timeout=30.0, cwd="."):
         resolved_cwd = self.path_policy.resolve(cwd).as_posix()
-        return self._exec(("--workdir", resolved_cwd, "/bin/sh", "-c", command), timeout)
+        return self._exec(("/bin/sh", "-c", command), timeout, workdir=resolved_cwd)
 
     def read_text(self, path: str) -> str:
         resolved = self.path_policy.resolve(path).as_posix()
-        result = self._exec(("cat", resolved), timeout=10)
+        result = self._exec(("cat", resolved), timeout=10, max_chars=None)
         if result.exit_code != 0:
             raise OSError(result.stderr)
         return result.stdout

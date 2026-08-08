@@ -50,3 +50,20 @@ def test_docker_executor_create_command_has_security_flags():
     assert "--user" in command
     assert "--label=sweforge.managed=true" in command
     assert "--label=sweforge.task_id=t1" in command
+
+
+def test_docker_exec_workdir_precedes_container_name(monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        import subprocess as sp
+        return sp.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    executor = DockerExecutor(image="img", container_name="c1", task_id="t1", env_id="e1")
+    executor._started = True  # skip actual container start
+    executor.run_argv(("echo", "hi"), cwd="sub")
+    command = captured["command"]
+    assert "--workdir" in command
+    assert command.index("--workdir") < command.index("c1")
