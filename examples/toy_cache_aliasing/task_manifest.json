@@ -4,14 +4,22 @@
     "repo": "toy_cache",
     "base_commit": "buggy",
     "problem_statement": "Fix the caching bug in toy_cache/cache.py. get_or_compute(key, compute) should cache each key's computed value so a repeated call for the same key returns the cached value without recomputing. The cache is currently indexed by the computed value instead of the key, so repeated calls for the same key recompute.",
-    "test_command": ["python", "-m", "unittest"],
-    "fail_to_pass": ["tests.test_f2p.F2PTest.test_repeated_key_does_not_recompute"],
-    "pass_to_pass": [
-      "tests.test_public.PublicTests.test_correct_value_returned",
-      "tests.test_public.PublicTests.test_repeat_returns_same_value"
+    "environment": {
+      "setup_commands": [],
+      "build_commands": [],
+      "test_commands": {
+        "test_repeated_key_does_not_recompute": ["python", "-m", "unittest", "tests.test_f2p.F2PTest.test_repeated_key_does_not_recompute"],
+        "test_correct_value_returned": ["python", "-m", "unittest", "tests.test_public.PublicTests.test_correct_value_returned"],
+        "test_repeat_returns_same_value": ["python", "-m", "unittest", "tests.test_public.PublicTests.test_repeat_returns_same_value"]
+      }
+    },
+    "fail_to_pass": [
+      {"test_id": "test_repeated_key_does_not_recompute", "kind": "fail_to_pass"}
     ],
-    "protected_paths": [".git"],
-    "platform": "linux/arm64",
+    "pass_to_pass": [
+      {"test_id": "test_correct_value_returned", "kind": "pass_to_pass"},
+      {"test_id": "test_repeat_returns_same_value", "kind": "pass_to_pass"}
+    ],
     "metadata": {"source": "toy", "bug_class": "cache-indexed-by-value"}
   },
   "integrity_protected": []

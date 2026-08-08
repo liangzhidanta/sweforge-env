@@ -8,10 +8,15 @@ version = "0.1.0"
 description = "Mac-side execution environment for SWE-Forge (env server, backends, clean verifier)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2",
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.9"]
-server = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -27,3 +32,17 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+# AutoDL 侧 verbatim 拷贝（源包 + 契约测试）不可编辑（VENDORED.md），
+# lint 风格以 AutoDL 侧为准；Mac 侧自己代码（env_server/ 等）保持本 pin 干净
+[tool.ruff.lint.per-file-ignores]
+"src/sweforge/schemas/*.py" = ["F401"]
+"src/sweforge/protocol/*.py" = ["F401"]
+"src/sweforge/environment/*.py" = ["F401"]
+"src/sweforge/reward/*.py" = ["F401"]
+"src/sweforge/agent/*.py" = ["F401"]
+"tests/helpers.py" = ["F401"]
+"tests/test_remote_environment.py" = ["F401"]
+"tests/test_reward_verifier.py" = ["F401", "F841"]
+"tests/test_tools_messages.py" = ["F401"]
+"tests/test_validate.py" = ["F401", "E402"]
