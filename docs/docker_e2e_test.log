@@ -1,6 +1,6 @@
 ======================================================================
  SWE-Forge Docker E2E Test Log（中文注释版）
- date : 2026-08-08 15:27:22 CST
+ date : 2026-08-08 16:49:56 CST
  host : wsh  (arch: arm64)
  cwd  : /Users/apple/code/SWE_project
 ======================================================================
@@ -54,12 +54,12 @@ ServerVersion=29.5.2  StorageDriver=overlayfs  OSType=linux  Architecture=aarch6
 
 【命令】colima status    （colima VM 状态: 运行中? 架构? runtime=docker?）
 【输出】
-time="2026-08-08T15:27:22+08:00" level=info msg="colima is running using macOS Virtualization.Framework"
-time="2026-08-08T15:27:22+08:00" level=info msg="arch: aarch64"
-time="2026-08-08T15:27:22+08:00" level=info msg="runtime: docker"
-time="2026-08-08T15:27:22+08:00" level=info msg="mountType: virtiofs"
-time="2026-08-08T15:27:22+08:00" level=info msg="docker socket: unix:///Users/apple/.colima/default/docker.sock"
-time="2026-08-08T15:27:22+08:00" level=info msg="containerd socket: unix:///Users/apple/.colima/default/containerd.sock"
+time="2026-08-08T16:49:57+08:00" level=info msg="colima is running using macOS Virtualization.Framework"
+time="2026-08-08T16:49:57+08:00" level=info msg="arch: aarch64"
+time="2026-08-08T16:49:57+08:00" level=info msg="runtime: docker"
+time="2026-08-08T16:49:57+08:00" level=info msg="mountType: virtiofs"
+time="2026-08-08T16:49:57+08:00" level=info msg="docker socket: unix:///Users/apple/.colima/default/docker.sock"
+time="2026-08-08T16:49:57+08:00" level=info msg="containerd socket: unix:///Users/apple/.colima/default/containerd.sock"
 
 ===== 块 2: 基础镜像 sweforge-base =====
 【目的】确认默认镜像已构建, 且满足契约: 非 root 用户(1000:1000)、
@@ -90,55 +90,118 @@ User=1000:1000  WorkDir=/workspace  Cmd=[python3]
 <missing>  ENV GPG_KEY=A035C8C19219BA821ECEA86B64E628F8…
 <missing>  RUN /bin/sh -c set -eux;  apt-get update;  a…
 
-===== 块 3: 模拟 AutoDL 任务 -> rollout 容器（docker 证据） =====
-【目的】演示 AutoDL 下发任务后, Mac 侧 LocalDockerBackend 如何:
-        创建 rollout 容器（每 env 一个, 非 root + --network none + 标签）
-        -> 容器内跑五工具 -> 导出 git patch -> 全新临时容器干净验证
-        （注入隐藏测试）-> 销毁。
-        注意: demo 内的「$ docker ps / docker inspect」是脚本自己打印的
-        docker 证据, 直观展示镜像=task.environment.image 解析结果、
-        NetworkMode=none、User=1000:1000、sweforge.managed 标签。
+===== 块 3: 模拟 AutoDL 任务 -> rollout 容器 + 容量实测 =====
+【目的】Part A 展示 AutoDL 客户端与 Mac 本机 Docker 的真实交互: 起一个
+        uvicorn(make_app(LocalDockerBackend(--docker))) server, 用 vendored
+        RemoteEnvironmentBackend（AutoDL 侧同一份契约客户端）驱动
+        health->register->create->五工具->verify->destroy, 每步打印 Mac 侧
+        docker 证据（docker ps/inspect）, 展示 create 起容器、execute 在
+        容器内 docker exec、verify 用全新临时容器、destroy 销毁。
+        Part B 容量实测: 同时开 5 个 rollout 容器, docker stats 测空闲基线,
+        容器内 ru_maxrss 测 pytest 峰值, 结合 colima VM 内存(8GiB) 推测本机
+        并发 rollout 上限。
+        （demo 内的「$ docker ...」行是脚本自己打印的 docker 证据）
 
-【命令】PYTHONPATH=src python examples/docker_rollout_demo.py
+【命令】NO_PROXY=127.0.0.1,localhost PYTHONPATH=src python examples/docker_rollout_demo.py
+        （NO_PROXY 是因为本机 Clash 代理会拦 127.0.0.1, HTTP 客户端需绕过）
 【输出】
 task_id        = toy_cache_aliasing
 image (task)   = (未指定, 用默认)
 image (resolved)= sweforge-base
 
---- [1] create: AutoDL 任务 -> rollout 容器 ---
-env_id         = toy_cache_aliasing
-container      = sweforge-task-toy_cache_al-afe2829b
+############################################################
+# Part A: AutoDL 客户端 ↔ Mac server ↔ Docker 交互           #
+############################################################
+
+拓扑: AutoDL Agent -> RemoteEnvironmentBackend -> HTTP(127.0.0.1)
+      -> Mac server(make_app + LocalDockerBackend) -> docker 容器
+
+  Mac server     = http://127.0.0.1:59716
+  AutoDL 客户端   = RemoteEnvironmentBackend(base_url=http://127.0.0.1:59716)
+                   (vendored 契约客户端, 与 AutoDL 侧同一份代码)
+
+--- [A1] health: 存活检查 ---
+[AutoDL] GET /health
+  <- 200 ok = True
+
+--- [A2] register: 登记任务 ---
+[AutoDL] POST /v1/tasks/register  {task_id=toy_cache_aliasing}
+  <- 200 toy_cache_aliasing
+
+--- [A3] create: AutoDL 发一个 create, Mac 就起一个容器 ---
+[AutoDL] POST /v1/envs  {task_id=toy_cache_aliasing}
+  -> make_app 路由到 LocalDockerBackend.create()
+  -> under the hood, 对每个 env 发的 docker run 命令:
+     docker \
+     run \
+     --detach \
+     --rm \
+     --network \
+     none \
+     --cpus \
+     2.0 \
+     --memory \
+     4g \
+     --pids-limit \
+     128 \
+     --user \
+     1000:1000 \
+     --workdir \
+     /workspace \
+     --name \
+     sweforge-task-<task_id前12位>-<随机8位> \
+     --label=sweforge.managed=true \
+     --label=sweforge.role=task \
+     --label=sweforge.task_id=toy_cache_aliasing \
+     --label=sweforge.env_id=toy_cache_aliasing \
+     sweforge-base \
+     sleep \
+     infinity
+  -> 再把 repo 快照 tar 进容器 (docker cp + 容器内 tar -xf),
+     然后容器内 git init/add/commit 打 baseline。
+  <- 200 env_id = toy_cache_aliasing
+
+[Mac docker] 这个 create 请求在 Mac 侧留下的容器证据:
 $ docker ps --filter label=sweforge.managed=true
-CONTAINER ID                                                       NAMES                                 IMAGE           STATUS
-d1f9f44c7a6a42f33c1a4711993a9ce5e3993dc25bbefdab84aa160c9e44f283   sweforge-task-toy_cache_al-afe2829b   sweforge-base   Up Less than a second
-$ docker inspect sweforge-task-toy_cache_al-afe2829b (image/network/user/labels)
+NAMES                                 IMAGE           STATUS
+sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up Less than a second
+
+$ docker inspect sweforge-task-toy_cache_al-a4f3f307 (image/network/user/labels)
 Image=sweforge-base  NetworkMode=none  User=1000:1000  Labels=map[sweforge.env_id:toy_cache_aliasing sweforge.managed:true sweforge.role:task sweforge.task_id:toy_cache_aliasing]
 
---- [2] 容器内跑 agent 工具 ---
-view_file: 11 行渲染成功
-search: 命中 4 处
-str_replace: success=True
-finish: 导出 patch（1 个文件）
+--- [A4] execute: AutoDL 的每个工具调用, 都在容器内 docker exec 执行 ---
+[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {view_file}
+  <- total_lines=11, 前 3 行:
+          1	"""A tiny keyed cache. Entries are indexed by their computed value (bug)."""
+          2	
+          3	_CACHE: dict[object, object] = {}
+[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {search '_CACHE'}
+  <- matches=4, 例: toy_cache/cache.py:3
+[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {str_replace}
+  <- success=True
+[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {finish}
+  <- 导出 patch（1 个文件）
+$ docker ps --filter label=sweforge.managed=true  (全程只有 1 个 rollout 容器)
+NAMES                                 IMAGE           STATUS
+sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up 2 seconds
 
---- [3] clean verify（全新临时容器 + 注入隐藏测试） ---
+--- [A5] verify: 全新临时容器干净验证（注入隐藏测试） ---
+[AutoDL] POST /v1/verifications  {task, patch}
+  -> make_app 调 LocalDockerBackend.verify(): 另起一个临时容器,
+     apply patch + 注入 private/hidden_tests + 跑 F2P/P2P/integrity
 {
   "verdict": "resolved",
   "f2p_passed": 1,
   "p2p_passed": 2,
   "integrity_ok": true,
-  "reward": 1.0,
-  "metadata": {
-    "backend": "local-docker",
-    "docker": true
-  }
+  "reward": 1.0
 }
-$ docker ps -a (verify 用临时容器应已销毁, 只剩 rollout 容器)
+$ docker ps -a --filter label=sweforge.managed=true  (verify 临时容器已销毁)
 NAMES                                 IMAGE           STATUS
-sweforge-task-toy_cache_al-afe2829b   sweforge-base   Up 2 seconds
+sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up 2 seconds
 
---- [4] 独立验证容器演示（fresh workspace + 隐藏测试注入） ---
-verify container = sweforge-verify-toy_cache_al-d419ca66
-$ docker inspect sweforge-verify-toy_cache_al-d419ca66 (image/network/user)
+--- [A6] verify 容器长什么样（独立演示 fresh workspace + 隐藏测试） ---
+verify container = sweforge-verify-toy_cache_al-901dc23c
 Image=sweforge-base  NetworkMode=none  User=1000:1000
 workspace 里的文件（含注入的隐藏测试 tests/）:
   toy_cache/__init__.py
@@ -147,9 +210,64 @@ workspace 里的文件（含注入的隐藏测试 tests/）:
   tests/__init__.py
   tests/test_public.py
 
---- [5] destroy rollout 容器 ---
+--- [A7] destroy: AutoDL 发 DELETE, Mac 销毁 rollout 容器 ---
+[AutoDL] DELETE /v1/envs/toy_cache_aliasing
+  <- 200, rollout 容器已销毁
 $ docker ps -a --filter label=sweforge.managed=true
-(无泄漏容器)
+NAMES     IMAGE     STATUS
+
+############################################################
+# Part B: 容器容量实测 —— 同时开 5 个 rollout 容器并推测上限        #
+############################################################
+
+本机资源:
+  宿主 RAM      = 8.0 GiB
+  colima VM     = 8 GiB 内存 / 4 CPU  (~/.colima/default/colima.yaml)
+  每容器限制     = --cpus 2 --memory 4g --pids-limit 128 (ContainerLimits)
+  (4g 是单容器硬上限, 不是典型占用)
+
+-- 阶段 1: 同时创建 5 个 rollout 容器（同一任务, 模拟一次问题开多个 rollout）--
+  已创建 5 个: sweforge-task-toy_cache_al-007e0eee, sweforge-task-toy_cache_al-4f57b315, sweforge-task-toy_cache_al-09b3f45f, sweforge-task-toy_cache_al-90a7aab2, sweforge-task-toy_cache_al-44bec413
+$ docker ps --filter label=sweforge.managed=true
+NAMES                                 STATUS
+sweforge-task-toy_cache_al-44bec413   Up Less than a second
+sweforge-task-toy_cache_al-90a7aab2   Up Less than a second
+sweforge-task-toy_cache_al-09b3f45f   Up 1 second
+sweforge-task-toy_cache_al-4f57b315   Up 1 second
+sweforge-task-toy_cache_al-007e0eee   Up 1 second
+
+$ docker stats --no-stream (每个容器的内存/CPU 占用, 空闲基线)
+NAME                                  MEM USAGE / LIMIT   MEM %     CPU %
+sweforge-task-toy_cache_al-007e0eee   628KiB / 4GiB       0.01%     0.00%
+sweforge-task-toy_cache_al-4f57b315   624KiB / 4GiB       0.01%     0.00%
+sweforge-task-toy_cache_al-09b3f45f   620KiB / 4GiB       0.01%     0.00%
+sweforge-task-toy_cache_al-90a7aab2   624KiB / 4GiB       0.01%     0.00%
+sweforge-task-toy_cache_al-44bec413   628KiB / 4GiB       0.01%     0.00%
+
+-- 阶段 2: 在一个容器里跑完整 pytest（真实验证负载）, 量它进程峰值内存 --
+  (在容器内用 resource.getrusage(RUSAGE_CHILDREN).ru_maxrss 取 pytest
+   子进程峰值, 比外部轮询 docker stats 更准: toy 测试 ~0.01s 就跑完, 轮询根本赶不上)
+  pytest 退出码 = 0
+  pytest 进程峰值内存 = 30 MiB (ru_maxrss)
+
+$ colima ssh -- free -m   (colima VM 内存现状)
+total        used        free      shared  buff/cache   available
+Mem:            7922         445        6433           1        1218        7476
+Swap:              0           0           0
+
+-- 推测: 本机并发 rollout 上限（内存维度） --
+  每容器空闲基线   ≈ 0.6 MiB  (docker stats, sleep 进程)
+  每容器 pytest 峰值 ≈ 30 MiB  (ru_maxrss)
+  每容器估算开销   ≈ +30 MiB (页面缓存/docker 层)
+  可用内存         ≈ 7476 MiB (colima VM free 的 available)
+  并发上限(内存)   ≈ 126 个 rollout 容器同时跑
+  留 50% 余量      → 建议 ≈ 63 个并发 rollout
+  注: 这是内存维度估计; CPU(VM 4 核, 每容器最多 2 核) 与 pids-limit
+      (每容器 128) 也会约束并发, 实际以压测为准。
+
+-- 清理: 销毁 5 个容器 --
+$ docker ps -a --filter label=sweforge.managed=true
+NAMES     STATUS
 
 ===== 块 4: 泄漏容器检查（全程结束） =====
 【目的】确认整个流程结束后, 没有残留的 sweforge.managed 容器（列表为空）。
