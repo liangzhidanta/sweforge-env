@@ -184,20 +184,25 @@ class DockerExecutor:
         except subprocess.TimeoutExpired:
             return CommandResult(124, "", "command timed out",
                                  int((time.monotonic() - started) * 1000), timed_out=True)
-        limit = self.max_output_chars if max_chars is None else max_chars
-        stdout, stdout_cut = _truncate(completed.stdout, limit)
-        stderr, stderr_cut = _truncate(completed.stderr, limit)
+        if max_chars is None:
+            stdout, stdout_cut = completed.stdout, False
+            stderr, stderr_cut = completed.stderr, False
+        else:
+            stdout, stdout_cut = _truncate(completed.stdout, max_chars)
+            stderr, stderr_cut = _truncate(completed.stderr, max_chars)
         return CommandResult(completed.returncode, stdout, stderr,
                              int((time.monotonic() - started) * 1000),
                              truncated=stdout_cut or stderr_cut)
 
     def run_argv(self, argv, timeout=30.0, cwd=".", input_text=None):
         resolved_cwd = self.path_policy.resolve(cwd).as_posix()
-        return self._exec(tuple(argv), timeout, input_text, workdir=resolved_cwd)
+        return self._exec(tuple(argv), timeout, input_text, workdir=resolved_cwd,
+                          max_chars=self.max_output_chars)
 
     def run_shell(self, command, timeout=30.0, cwd="."):
         resolved_cwd = self.path_policy.resolve(cwd).as_posix()
-        return self._exec(("/bin/sh", "-c", command), timeout, workdir=resolved_cwd)
+        return self._exec(("/bin/sh", "-c", command), timeout, workdir=resolved_cwd,
+                          max_chars=self.max_output_chars)
 
     def read_text(self, path: str) -> str:
         resolved = self.path_policy.resolve(path).as_posix()
@@ -208,7 +213,8 @@ class DockerExecutor:
 
     def write_text(self, path: str, content: str) -> None:
         resolved = self.path_policy.resolve(path).as_posix()
-        result = self._exec(("/bin/sh", "-c", f"cat > {resolved}"), timeout=10, input_text=content)
+        result = self._exec(("/bin/sh", "-c", f"cat > {resolved}"), timeout=10,
+                            input_text=content, max_chars=self.max_output_chars)
         if result.exit_code != 0:
             raise OSError(result.stderr)
 
