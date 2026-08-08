@@ -1,7 +1,5 @@
 import json
 
-import pytest
-
 from sweforge.protocol import trajectory_from_dict, trajectory_to_json, validate_trajectory
 from sweforge.schemas import AgentTrajectory, Observation, ToolAction, TrajectoryStep
 
@@ -44,9 +42,22 @@ def test_empty_task_id_flagged():
     assert any("task_id" in error for error in validate_trajectory(AgentTrajectory("", ())))
 
 
+def test_str_replace_missing_single_argument_flagged():
+    trajectory = AgentTrajectory("t1", steps=(_step("str_replace", {"path": "a.py", "old": "x"}),))
+    errors = validate_trajectory(trajectory)
+    assert any("missing arguments ['new']" in error for error in errors)
+
+
+def test_search_missing_pattern_flagged():
+    trajectory = AgentTrajectory("t1", steps=(_step("search", {"max_results": 5}),))
+    errors = validate_trajectory(trajectory)
+    assert any("missing arguments ['pattern']" in error for error in errors)
+
+
 def test_json_round_trip():
-    trajectory = AgentTrajectory("t1", steps=(
-        _step("bash", {"command": "pwd"}),
-    ))
+    action = ToolAction("bash", {"command": "pwd"}, request_id="r9")
+    observation = Observation(request_id="r9", env_id="e1", tool="bash", exit_code=0,
+                              stdout="out", stderr="err", content="c", truncated=True, duration_ms=12)
+    trajectory = AgentTrajectory("t1", steps=(TrajectoryStep(action, observation),))
     parsed = trajectory_from_dict(json.loads(trajectory_to_json(trajectory)))
     assert parsed == trajectory
