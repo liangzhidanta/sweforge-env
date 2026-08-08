@@ -1,6 +1,6 @@
 ======================================================================
  SWE-Forge Docker E2E Test Log（中文注释版）
- date : 2026-08-08 16:49:56 CST
+ date : 2026-08-08 17:03:20 CST
  host : wsh  (arch: arm64)
  cwd  : /Users/apple/code/SWE_project
 ======================================================================
@@ -54,12 +54,12 @@ ServerVersion=29.5.2  StorageDriver=overlayfs  OSType=linux  Architecture=aarch6
 
 【命令】colima status    （colima VM 状态: 运行中? 架构? runtime=docker?）
 【输出】
-time="2026-08-08T16:49:57+08:00" level=info msg="colima is running using macOS Virtualization.Framework"
-time="2026-08-08T16:49:57+08:00" level=info msg="arch: aarch64"
-time="2026-08-08T16:49:57+08:00" level=info msg="runtime: docker"
-time="2026-08-08T16:49:57+08:00" level=info msg="mountType: virtiofs"
-time="2026-08-08T16:49:57+08:00" level=info msg="docker socket: unix:///Users/apple/.colima/default/docker.sock"
-time="2026-08-08T16:49:57+08:00" level=info msg="containerd socket: unix:///Users/apple/.colima/default/containerd.sock"
+time="2026-08-08T17:03:20+08:00" level=info msg="colima is running using macOS Virtualization.Framework"
+time="2026-08-08T17:03:20+08:00" level=info msg="arch: aarch64"
+time="2026-08-08T17:03:20+08:00" level=info msg="runtime: docker"
+time="2026-08-08T17:03:20+08:00" level=info msg="mountType: virtiofs"
+time="2026-08-08T17:03:20+08:00" level=info msg="docker socket: unix:///Users/apple/.colima/default/docker.sock"
+time="2026-08-08T17:03:20+08:00" level=info msg="containerd socket: unix:///Users/apple/.colima/default/containerd.sock"
 
 ===== 块 2: 基础镜像 sweforge-base =====
 【目的】确认默认镜像已构建, 且满足契约: 非 root 用户(1000:1000)、
@@ -90,180 +90,208 @@ User=1000:1000  WorkDir=/workspace  Cmd=[python3]
 <missing>  ENV GPG_KEY=A035C8C19219BA821ECEA86B64E628F8…
 <missing>  RUN /bin/sh -c set -eux;  apt-get update;  a…
 
-===== 块 3: 模拟 AutoDL 任务 -> rollout 容器 + 容量实测 =====
-【目的】Part A 展示 AutoDL 客户端与 Mac 本机 Docker 的真实交互: 起一个
-        uvicorn(make_app(LocalDockerBackend(--docker))) server, 用 vendored
-        RemoteEnvironmentBackend（AutoDL 侧同一份契约客户端）驱动
-        health->register->create->五工具->verify->destroy, 每步打印 Mac 侧
-        docker 证据（docker ps/inspect）, 展示 create 起容器、execute 在
-        容器内 docker exec、verify 用全新临时容器、destroy 销毁。
-        Part B 容量实测: 同时开 5 个 rollout 容器, docker stats 测空闲基线,
-        容器内 ru_maxrss 测 pytest 峰值, 结合 colima VM 内存(8GiB) 推测本机
-        并发 rollout 上限。
-        （demo 内的「$ docker ...」行是脚本自己打印的 docker 证据）
+===== 块 3: 真实 coding 环境容器 + 并发真实交互（raw docker 输出） =====
+【目的】Part A 部署一个真实 coding 环境容器（sweforge-base + toy_cache 仓库,
+        并注入 Mac 私有的隐藏 F2P 测试）, 用原始 docker exec 走一遍 agent 的
+        完整动作链: 读文件(cat) -> 搜索(grep) -> 跑测试(pytest, 复现 bug 失败)
+        -> 修复(python 改文件) -> 再跑测试(通过) -> 导 patch(git diff)。
+        每步打印真实 docker 命令与容器返回的原始输出, 即「docker 传出的内容」。
+        Part B 并发真实交互: 同时创建 5 个 rollout 容器, Barrier 让它们同一
+        时刻开跑「修复 + 连续 pytest」真实负载, 用 docker ps / docker top /
+        docker stats / 墙钟时间证明 5 个容器是真实并行工作而非空跑。
+        （demo 内的「$ docker exec ...」行是真实执行的 docker 命令）
 
-【命令】NO_PROXY=127.0.0.1,localhost PYTHONPATH=src python examples/docker_rollout_demo.py
-        （NO_PROXY 是因为本机 Clash 代理会拦 127.0.0.1, HTTP 客户端需绕过）
+【命令】NO_PROXY=127.0.0.1,localhost PYTHONPATH=src python examples/docker_coding_demo.py
 【输出】
 task_id        = toy_cache_aliasing
-image (task)   = (未指定, 用默认)
 image (resolved)= sweforge-base
 
 ############################################################
-# Part A: AutoDL 客户端 ↔ Mac server ↔ Docker 交互           #
+# Part A: 部署真实 coding 环境容器, 看 docker 传出的原始内容   #
 ############################################################
-
-拓扑: AutoDL Agent -> RemoteEnvironmentBackend -> HTTP(127.0.0.1)
-      -> Mac server(make_app + LocalDockerBackend) -> docker 容器
-
-  Mac server     = http://127.0.0.1:59716
-  AutoDL 客户端   = RemoteEnvironmentBackend(base_url=http://127.0.0.1:59716)
-                   (vendored 契约客户端, 与 AutoDL 侧同一份代码)
-
---- [A1] health: 存活检查 ---
-[AutoDL] GET /health
-  <- 200 ok = True
-
---- [A2] register: 登记任务 ---
-[AutoDL] POST /v1/tasks/register  {task_id=toy_cache_aliasing}
-  <- 200 toy_cache_aliasing
-
---- [A3] create: AutoDL 发一个 create, Mac 就起一个容器 ---
-[AutoDL] POST /v1/envs  {task_id=toy_cache_aliasing}
-  -> make_app 路由到 LocalDockerBackend.create()
-  -> under the hood, 对每个 env 发的 docker run 命令:
-     docker \
-     run \
-     --detach \
-     --rm \
-     --network \
-     none \
-     --cpus \
-     2.0 \
-     --memory \
-     4g \
-     --pids-limit \
-     128 \
-     --user \
-     1000:1000 \
-     --workdir \
-     /workspace \
-     --name \
-     sweforge-task-<task_id前12位>-<随机8位> \
-     --label=sweforge.managed=true \
-     --label=sweforge.role=task \
-     --label=sweforge.task_id=toy_cache_aliasing \
-     --label=sweforge.env_id=toy_cache_aliasing \
-     sweforge-base \
-     sleep \
-     infinity
-  -> 再把 repo 快照 tar 进容器 (docker cp + 容器内 tar -xf),
-     然后容器内 git init/add/commit 打 baseline。
-  <- 200 env_id = toy_cache_aliasing
-
-[Mac docker] 这个 create 请求在 Mac 侧留下的容器证据:
+已部署 coding 环境容器: sweforge-task-toy_cache_al-22c3d6c4  (镜像 sweforge-base, 内含 toy_cache 仓库)
 $ docker ps --filter label=sweforge.managed=true
 NAMES                                 IMAGE           STATUS
-sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up Less than a second
-
-$ docker inspect sweforge-task-toy_cache_al-a4f3f307 (image/network/user/labels)
+sweforge-task-toy_cache_al-22c3d6c4   sweforge-base   Up Less than a second
+$ docker inspect --format 'Image/NetworkMode/User/Labels'
 Image=sweforge-base  NetworkMode=none  User=1000:1000  Labels=map[sweforge.env_id:toy_cache_aliasing sweforge.managed:true sweforge.role:task sweforge.task_id:toy_cache_aliasing]
 
---- [A4] execute: AutoDL 的每个工具调用, 都在容器内 docker exec 执行 ---
-[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {view_file}
-  <- total_lines=11, 前 3 行:
-          1	"""A tiny keyed cache. Entries are indexed by their computed value (bug)."""
-          2	
-          3	_CACHE: dict[object, object] = {}
-[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {search '_CACHE'}
-  <- matches=4, 例: toy_cache/cache.py:3
-[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {str_replace}
-  <- success=True
-[AutoDL] POST /v1/envs/toy_cache_aliasing/actions  {finish}
-  <- 导出 patch（1 个文件）
-$ docker ps --filter label=sweforge.managed=true  (全程只有 1 个 rollout 容器)
-NAMES                                 IMAGE           STATUS
-sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up 2 seconds
+-- 把 Mac 私有的隐藏 F2P 测试注入容器（与 verify 同款机制: docker exec 写入） --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 ls /workspace/tests/
+__init__.py
+test_f2p.py
+test_public.py
 
---- [A5] verify: 全新临时容器干净验证（注入隐藏测试） ---
-[AutoDL] POST /v1/verifications  {task, patch}
-  -> make_app 调 LocalDockerBackend.verify(): 另起一个临时容器,
-     apply patch + 注入 private/hidden_tests + 跑 F2P/P2P/integrity
-{
-  "verdict": "resolved",
-  "f2p_passed": 1,
-  "p2p_passed": 2,
-  "integrity_ok": true,
-  "reward": 1.0
-}
-$ docker ps -a --filter label=sweforge.managed=true  (verify 临时容器已销毁)
-NAMES                                 IMAGE           STATUS
-sweforge-task-toy_cache_al-a4f3f307   sweforge-base   Up 2 seconds
+-- [1] agent 读文件 -> docker exec cat（原始内容） --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'cat /workspace/toy_cache/cache.py'
+"""A tiny keyed cache. Entries are indexed by their computed value (bug)."""
 
---- [A6] verify 容器长什么样（独立演示 fresh workspace + 隐藏测试） ---
-verify container = sweforge-verify-toy_cache_al-901dc23c
-Image=sweforge-base  NetworkMode=none  User=1000:1000
-workspace 里的文件（含注入的隐藏测试 tests/）:
-  toy_cache/__init__.py
-  toy_cache/cache.py
-  pyproject.toml
-  tests/__init__.py
-  tests/test_public.py
+_CACHE: dict[object, object] = {}
 
---- [A7] destroy: AutoDL 发 DELETE, Mac 销毁 rollout 容器 ---
-[AutoDL] DELETE /v1/envs/toy_cache_aliasing
-  <- 200, rollout 容器已销毁
-$ docker ps -a --filter label=sweforge.managed=true
-NAMES     IMAGE     STATUS
+
+def get_or_compute(key: str, compute) -> object:
+    """Return a cached value for ``key``, computing it once if absent."""
+    value = compute()
+    if value not in _CACHE:
+        _CACHE[value] = value
+    return _CACHE[value]
+  (exit 0)
+
+-- [2] agent 搜索 -> docker exec grep --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'grep -rn "_CACHE" /workspace/toy_cache'
+/workspace/toy_cache/cache.py:3:_CACHE: dict[object, object] = {}
+/workspace/toy_cache/cache.py:9:    if value not in _CACHE:
+/workspace/toy_cache/cache.py:10:        _CACHE[value] = value
+/workspace/toy_cache/cache.py:11:    return _CACHE[value]
+  (exit 0)
+
+-- [3] agent 跑测试 -> docker exec pytest（隐藏 F2P 应失败 = 复现 bug） --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'cd /workspace && python3 -m pytest -q -p no:cacheprovider'
+F..                                                                      [100%]
+=================================== FAILURES ===================================
+_________________ F2PTest.test_repeated_key_does_not_recompute _________________
+
+self = <tests.test_f2p.F2PTest testMethod=test_repeated_key_does_not_recompute>
+
+    def test_repeated_key_does_not_recompute(self):
+        calls: list[str] = []
+    
+        def compute() -> int:
+            calls.append("compute")
+            return 42
+    
+        self.assertEqual(get_or_compute("f2p-unique-key", compute), 42)
+        self.assertEqual(get_or_compute("f2p-unique-key", compute), 42)
+>       self.assertEqual(calls, ["compute"])
+E       AssertionError: Lists differ: ['compute', 'compute'] != ['compute']
+E       
+E       First list contains 1 additional elements.
+E       First extra element 1:
+E       'compute'
+E       
+E       - ['compute', 'compute']
+E       + ['compute']
+
+tests/test_f2p.py:16: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_f2p.py::F2PTest::test_repeated_key_does_not_recompute - Ass...
+1 failed, 2 passed in 0.01s
+  (exit 1)
+
+-- [4] agent 修复 -> docker exec python 做 str_replace --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c <<'SHELL'
+    python3 - <<'PYEOF'
+    import pathlib
+    p = pathlib.Path('/workspace/toy_cache/cache.py')
+    s = p.read_text()
+    old = '    value = compute()\n    if value not in _CACHE:\n        _CACHE[value] = value\n    return _CACHE[value]\n'
+    new = '    if key not in _CACHE:\n        _CACHE[key] = compute()\n    return _CACHE[key]\n'
+    n = s.count(old)
+    if n == 1:
+        p.write_text(s.replace(old, new))
+        print('str_replace: 1 occurrence replaced -> cache keyed by key, not value')
+    elif n == 0:
+        print('str_replace: already applied (0 occurrences)')
+    else:
+        raise AssertionError(f'expected at most 1 occurrence, got {n}')
+    PYEOF
+    SHELL
+str_replace: 1 occurrence replaced -> cache keyed by key, not value
+  (exit 0)
+
+-- [5] 修复后再读 -> docker exec cat（对比第 1 步） --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'cat /workspace/toy_cache/cache.py'
+"""A tiny keyed cache. Entries are indexed by their computed value (bug)."""
+
+_CACHE: dict[object, object] = {}
+
+
+def get_or_compute(key: str, compute) -> object:
+    """Return a cached value for ``key``, computing it once if absent."""
+    if key not in _CACHE:
+        _CACHE[key] = compute()
+    return _CACHE[key]
+  (exit 0)
+
+-- [6] agent 再跑测试 -> docker exec pytest（应全部通过） --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'cd /workspace && python3 -m pytest -q -p no:cacheprovider'
+...                                                                      [100%]
+3 passed in 0.00s
+  (exit 0)
+
+-- [7] agent 导出 patch -> docker exec git diff --
+$ docker exec sweforge-task-toy_cache_al-22c3d6c4 /bin/sh -c 'cd /workspace && git diff --no-ext-diff -- toy_cache/cache.py'
+diff --git a/toy_cache/cache.py b/toy_cache/cache.py
+index 862d097..4501bbd 100644
+--- a/toy_cache/cache.py
++++ b/toy_cache/cache.py
+@@ -5,7 +5,6 @@ _CACHE: dict[object, object] = {}
+ 
+ def get_or_compute(key: str, compute) -> object:
+     """Return a cached value for ``key``, computing it once if absent."""
+-    value = compute()
+-    if value not in _CACHE:
+-        _CACHE[value] = value
+-    return _CACHE[value]
++    if key not in _CACHE:
++        _CACHE[key] = compute()
++    return _CACHE[key]
+  (exit 0)
+$ docker ps -a --filter label=sweforge.managed=true  (已销毁)
+NAMES     STATUS
 
 ############################################################
-# Part B: 容器容量实测 —— 同时开 5 个 rollout 容器并推测上限        #
+# Part B: 并发真实交互 —— 5 个容器同时做真实修复+测试          #
 ############################################################
 
-本机资源:
-  宿主 RAM      = 8.0 GiB
-  colima VM     = 8 GiB 内存 / 4 CPU  (~/.colima/default/colima.yaml)
-  每容器限制     = --cpus 2 --memory 4g --pids-limit 128 (ContainerLimits)
-  (4g 是单容器硬上限, 不是典型占用)
-
--- 阶段 1: 同时创建 5 个 rollout 容器（同一任务, 模拟一次问题开多个 rollout）--
-  已创建 5 个: sweforge-task-toy_cache_al-007e0eee, sweforge-task-toy_cache_al-4f57b315, sweforge-task-toy_cache_al-09b3f45f, sweforge-task-toy_cache_al-90a7aab2, sweforge-task-toy_cache_al-44bec413
+-- 创建 5 个 rollout 容器（各带真实仓库 + 注入隐藏 F2P 测试） --
+  已创建 5 个: sweforge-task-toy_cache_al-e238d895, sweforge-task-toy_cache_al-4d5b08a4, sweforge-task-toy_cache_al-67802488, sweforge-task-toy_cache_al-5f169f72, sweforge-task-toy_cache_al-1f78d8b9
 $ docker ps --filter label=sweforge.managed=true
 NAMES                                 STATUS
-sweforge-task-toy_cache_al-44bec413   Up Less than a second
-sweforge-task-toy_cache_al-90a7aab2   Up Less than a second
-sweforge-task-toy_cache_al-09b3f45f   Up 1 second
-sweforge-task-toy_cache_al-4f57b315   Up 1 second
-sweforge-task-toy_cache_al-007e0eee   Up 1 second
+sweforge-task-toy_cache_al-1f78d8b9   Up Less than a second
+sweforge-task-toy_cache_al-5f169f72   Up Less than a second
+sweforge-task-toy_cache_al-67802488   Up 1 second
+sweforge-task-toy_cache_al-4d5b08a4   Up 1 second
+sweforge-task-toy_cache_al-e238d895   Up 1 second
 
-$ docker stats --no-stream (每个容器的内存/CPU 占用, 空闲基线)
+-- 先测单个容器的耗时（做一遍 fix + pytest×12 需要多久） --
+  容器 sweforge-task-toy_cache_al-e238d895: fix_rc=0 pytest_rc=0  耗时 1.5s
+  5 个如果串行做会花 ≈ 7.6s; 如果并行 ≈ 1.5s
+
+-- Barrier 让 5 个容器同一时刻开跑同样的真实负载 --
+
+  运行中证据（5 个容器都在干活）:
+$ docker ps  (5 个同时 Up)
+NAMES                                 STATUS
+sweforge-task-toy_cache_al-1f78d8b9   Up 3 seconds
+sweforge-task-toy_cache_al-5f169f72   Up 3 seconds
+sweforge-task-toy_cache_al-67802488   Up 3 seconds
+sweforge-task-toy_cache_al-4d5b08a4   Up 4 seconds
+sweforge-task-toy_cache_al-e238d895   Up 4 seconds
+$ docker top sweforge-task-toy_cache_al-e238d895  (容器 0 里实际进程: 应能看到 python pytest 在跑)
+UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD
+1000                47090               47066               0                   17:03               ?                   00:00:00            sleep infinity
+1000                48312               47066               0                   17:03               ?                   00:00:00            /bin/sh -c i=0; while [ $i -lt 12 ]; do python3 -m pytest -q -p no:cacheprovider || exit $?; i=$((i+1)); done
+1000                48341               48312               91                  17:03               ?                   00:00:00            python3 -m pytest -q -p no:cacheprovider
+$ docker stats --no-stream  (5 个同时的内存, 都应 > 空闲基线 0.6MiB)
 NAME                                  MEM USAGE / LIMIT   MEM %     CPU %
-sweforge-task-toy_cache_al-007e0eee   628KiB / 4GiB       0.01%     0.00%
-sweforge-task-toy_cache_al-4f57b315   624KiB / 4GiB       0.01%     0.00%
-sweforge-task-toy_cache_al-09b3f45f   620KiB / 4GiB       0.01%     0.00%
-sweforge-task-toy_cache_al-90a7aab2   624KiB / 4GiB       0.01%     0.00%
-sweforge-task-toy_cache_al-44bec413   628KiB / 4GiB       0.01%     0.00%
+sweforge-task-toy_cache_al-e238d895   1.434MiB / 4GiB     0.03%     27.30%
+sweforge-task-toy_cache_al-4d5b08a4   1.316MiB / 4GiB     0.03%     27.20%
+sweforge-task-toy_cache_al-67802488   1.305MiB / 4GiB     0.03%     30.57%
+sweforge-task-toy_cache_al-5f169f72   1.305MiB / 4GiB     0.03%     25.47%
+sweforge-task-toy_cache_al-1f78d8b9   1.309MiB / 4GiB     0.03%     19.43%
 
--- 阶段 2: 在一个容器里跑完整 pytest（真实验证负载）, 量它进程峰值内存 --
-  (在容器内用 resource.getrusage(RUSAGE_CHILDREN).ru_maxrss 取 pytest
-   子进程峰值, 比外部轮询 docker stats 更准: toy 测试 ~0.01s 就跑完, 轮询根本赶不上)
-  pytest 退出码 = 0
-  pytest 进程峰值内存 = 30 MiB (ru_maxrss)
-
-$ colima ssh -- free -m   (colima VM 内存现状)
-total        used        free      shared  buff/cache   available
-Mem:            7922         445        6433           1        1218        7476
-Swap:              0           0           0
-
--- 推测: 本机并发 rollout 上限（内存维度） --
-  每容器空闲基线   ≈ 0.6 MiB  (docker stats, sleep 进程)
-  每容器 pytest 峰值 ≈ 30 MiB  (ru_maxrss)
-  每容器估算开销   ≈ +30 MiB (页面缓存/docker 层)
-  可用内存         ≈ 7476 MiB (colima VM free 的 available)
-  并发上限(内存)   ≈ 126 个 rollout 容器同时跑
-  留 50% 余量      → 建议 ≈ 63 个并发 rollout
-  注: 这是内存维度估计; CPU(VM 4 核, 每容器最多 2 核) 与 pids-limit
-      (每容器 128) 也会约束并发, 实际以压测为准。
+-- 并发结果 --
+  sweforge-task-toy_cache_al-e238d895: fix_rc=0  pytest_rc=0  本容器耗时 2.4s
+  sweforge-task-toy_cache_al-4d5b08a4: fix_rc=0  pytest_rc=0  本容器耗时 2.3s
+  sweforge-task-toy_cache_al-67802488: fix_rc=0  pytest_rc=0  本容器耗时 2.4s
+  sweforge-task-toy_cache_al-5f169f72: fix_rc=0  pytest_rc=0  本容器耗时 2.4s
+  sweforge-task-toy_cache_al-1f78d8b9: fix_rc=0  pytest_rc=0  本容器耗时 2.2s
+  5 个并发总墙钟 = 4.2s   (若串行会 ≈ 7.6s -> 省 44% 时间)
+  每个容器本机耗时 2.2-2.4s（含 5 容器抢 4 核的 CPU 争抢）
+  并发期间 docker stats 峰值(单容器) ≈ 24 MiB (空闲基线 0.6 MiB)
+  结论: 墙钟 << 串行时间, 且 docker ps/top/stats 同时抓到 5 个容器都在真实工作,
+        证明 5 个 rollout 容器是并行运行的真实交互, 不是空跑。
 
 -- 清理: 销毁 5 个容器 --
 $ docker ps -a --filter label=sweforge.managed=true
