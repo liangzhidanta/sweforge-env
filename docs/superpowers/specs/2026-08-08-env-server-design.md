@@ -1,7 +1,7 @@
 # SWE-Forge Environment Server — M1 Design
 
 - Date: 2026-08-08
-- Status: Approved scope (M1), awaiting AutoDL schema reconciliation
+- Status: Approved scope (M1); R1+R2 landed 2026-08-08（见下文 status update）
 
 > **2026-08-08 status update（R1+R2 落地后，本文档部分内容已被取代）**
 >
@@ -28,7 +28,7 @@ SWE-Forge 分两侧：**AutoDL**（模型 / SFT / Agent Loop / Rollout / GRPO）
 3. LocalDockerBackend
 4. ToolAction / Observation 集成测试（含 validate_trajectory）
 
-M2+（FastAPI Remote API、auth、clean verifier 作为远程服务、Task Registry、Docker Executor 加固、SSH tunnel、AutoDL E2E）不在此次范围。
+M2+ 原列项中 **已提前落地**（见顶部 status update）：FastAPI /v1 server、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路）。仍属 M2+：Bearer auth、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、DockerExecutor stale cleanup、跨机 SSH tunnel + 真机 AutoDL host 对接。
 
 **本机约束**：Mac 为 arm64，`docker` 未安装。因此 LocalDockerBackend 采用 executor 策略——默认 `LocalExecutor`（本机可跑），检测到 Docker 时可用 `DockerExecutor`（真实容器）。两种 executor 共享同一套 tool 语义与 Observation 输出，保证 AutoDL 对接代码不因 host 类型变化。
 
@@ -45,7 +45,8 @@ M2+（FastAPI Remote API、auth、clean verifier 作为远程服务、Task Regis
 ```python
 ToolAction(tool: str, arguments: Mapping[str, Any], request_id: str = "")
 ```
-`request_id` 由客户端生成，回填进 Observation，供幂等（M2）与轨迹校验使用。
+`request_id` 由客户端生成，供幂等与轨迹校验使用。注意：canonical 协议里 ToolAction 不携带
+request_id——幂等由 server 传输层处理（vendored `environment/server.py` 的 idempotency cache，已落地）。
 
 ### Observation（§8 字段，结构化、稳定、长度受控）
 ```python
@@ -145,4 +146,6 @@ M1 的 integrity 实现最小集：protected path 哈希比对 + patch 内路径
 
 ## 8. Out of Scope (M2+)
 
-FastAPI `/v1` 路由 + Bearer auth + request_id 幂等、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、DockerExecutor 完整加固与 stale cleanup、SSH reverse tunnel、AutoDL E2E 与 `validate_trajectory()` 真机对接。
+已落地（见顶部 status update 与 `USAGE.txt`）：FastAPI `/v1` 路由（vendored `make_app` + `env_server/server.py`）、request_id 幂等、DockerExecutor 完整接线、SSH tunnel 拓扑、AutoDL E2E（interop_mac.py 本地全链路通过）。
+
+仍属 M2+：Bearer auth、Task Registry（Mac 私有 secrets）、Clean Verifier 服务化、DockerExecutor stale cleanup、SSH reverse tunnel 真机建立、AutoDL 跨机 host 真机对接（`validate_trajectory()` 已在本地 E2E 验证）。
