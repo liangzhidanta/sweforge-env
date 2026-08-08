@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -251,20 +252,25 @@ class DockerExecutor:
         is owned by the container's uid 1000 user (docker cp alone would leave
         host ownership). Runs as the default container user, which can already
         write to /workspace (created + chowned in the base image).
+
+        The archive is built with Python's tarfile module, NOT the host `tar`
+        binary: macOS bsdtar synthesizes AppleDouble ``._*`` entries from host
+        file xattrs (hidden even from its own ``-tf``) that the container's GNU
+        tar materializes as real files, polluting the workspace.
         """
         self.start()
         with tempfile.NamedTemporaryFile(prefix="sweforge-seed-", suffix=".tar", delete=False) as handle:
             tar_path = handle.name
         try:
-            made = subprocess.run(
-                ("tar", "--no-xattrs", "-C", str(snapshot),
-                 "--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.pytest_cache",
-                 "-cf", tar_path, "."),
-                capture_output=True, text=True, check=False,
-            )
-            if made.returncode != 0:
-                raise OSError(f"failed to build seed archive: {made.stderr.strip()}")
-            # --no-xattrs 避免 macOS xattr 头让容器内 GNU tar 打 warning;
+            with tarfile.open(tar_path, "w") as archive:
+                for path in sorted(snapshot.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    if "__pycache__" in path.parts or ".pytest_cache" in path.parts:
+                        continue
+                    if path.suffix == ".pyc":
+                        continue
+                    archive.add(path, arcname=path.relative_to(snapshot).as_posix())
             # NamedTemporaryFile 0600 -> docker cp 原样保留, 容器 uid 1000 读不了。
             os.chmod(tar_path, 0o644)
             self._copy_in(tar_path, "/tmp/sweforge-seed.tar")

@@ -108,6 +108,24 @@ def test_full_rollout_loop_and_clean_verify_docker():
     assert result.metadata["docker"] is True
 
 
+@requires_docker
+def test_docker_seed_has_no_appledouble_entries():
+    """回归: macOS bsdtar 会合成 AppleDouble ._* 条目, 容器内 GNU tar 会
+    物化这些文件污染 workspace。seed 必须走 Python tarfile, 产物零 ._*。"""
+    task = load_task_bundle(EXAMPLES).task
+    backend = LocalDockerBackend(EXAMPLES.parent, use_docker=True)
+    bundle = backend._bundle(task)
+    executor = backend._make_executor(bundle, "verify")
+    try:
+        files = executor.list_files()
+        assert files, "seeded workspace should not be empty"
+        polluted = [rel for rel in files if Path(rel).name.startswith("._") or "AppleDouble" in rel]
+        assert polluted == [], f"AppleDouble pollution in seeded workspace: {polluted}"
+        assert "toy_cache/cache.py" in files
+    finally:
+        executor.close()
+
+
 def test_unfixed_patch_is_not_resolved():
     task = load_task_bundle(EXAMPLES).task
     backend = LocalDockerBackend(EXAMPLES.parent)
