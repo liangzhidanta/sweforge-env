@@ -1,0 +1,242 @@
+=====================================================================
+ SWE-Forge 两端连接使用说明（AutoDL ↔ Mac Docker 已实测成功）
+ 验证日期: 2026-08-09 00:25 CST
+ 拓扑: AutoDL Agent/LLM -> RemoteEnvironmentBackend -> HTTP
+       -> 反向 SSH tunnel -> Mac Environment Server (127.0.0.1:8500)
+       -> Docker 容器（每 env 一个, --network none, --user 1000:1000）
+=====================================================================
+
+0. 结论（本次实测结果）
+---------------------------------------------------------------------
+  ✅ 两端连接已打通, 全链路实测通过:
+     1. interop_mac.py 契约直连全流程 exit 0
+        （health -> register -> create -> 五工具 -> patch -> verify
+          -> AgentLoop + validate_trajectory）; verify verdict=resolved。
+     2. LLMPolicy 真实 parse 管线 -> Mac Docker: agent_finished,
+        turns=3（view_file -> str_replace -> finish）, patch 正确,
+        validate_trajectory 通过。
+     3. 真实 LLM(vLLM + Qwen3-0.6B) 加载并驱动 rollout: 管线完整跑通,
+        但 Base / 12 步 SFT 模型尚未学会输出 <tool_call> 格式
+        （输出乱码）-> AGENT_ERROR。这是模型能力问题, 不是连接问题。
+     4. Mac Docker 侧证据: server 日志显示每个 HTTP 请求都进容器
+        （create/actions/patch/destroy）, 容器用后即毁, 无泄漏。
+
+  ⚠️ 未接线项: 真实 GRPO rollout 的 verifier reward 目前仍是「格式
+     奖励」（rl_reward_toolcall.py: canonical 解析判据 0/1）, 不是
+     CleanVerifier 的 resolved reward。正式 verifier reward（rollout
+     轨迹 patch -> Mac /v1/verifications -> reward）属后续阶段, 需
+     在 AutoDL 侧改 reward 函数（见 §6）, 且按铁律改 AutoDL 代码要
+     你同意。
+
+  ⚠️ 本次补充（2026-08-09, Clash 关闭后重连）:
+     5. 关 Clash（系统代理 HTTPEnable=0）后: Mac 命令无需 NO_PROXY;
+        反向隧道仍必须（Mac 内网 IP、无 SSH 服务）, 连接拓扑不变。
+     6. 两端「连接提示」已加: Mac server 首次收到 AutoDL 创建环境
+        （POST /v1/envs）时, Mac 终端打印 [连接提示] 横幅; AutoDL 侧
+        由驱动脚本输出（health / 每步动作 / agent_finished / turns /
+        patch）作为连接提示。详见 §8。
+     7. 本次两端终端全部命令+输出实录见同目录
+        docs/两端连接实录_2026-08-09_clashoff.txt。
+
+=====================================================================
+1. 前置条件（两端）
+=====================================================================
+  Mac 侧:
+    - macOS + Docker（本机用 colima）; 基础镜像已建:
+        docker build -t sweforge-base src/sweforge/env_server/docker/
+    - Python 3.12 (base conda env), 项目 /Users/apple/code/SWE_project
+    - Clash 代理: 若开启会拦 127.0.0.1, 本地 HTTP 命令需加
+      NO_PROXY=127.0.0.1,localhost; 若关闭（2026-08-09 实测系统代理
+      HTTPEnable=0）则不需要, curl 直接通。关 Clash 只省 NO_PROXY,
+      不会让连接拓扑变简单——反向隧道仍必须。
+
+  AutoDL 侧:
+    - conda env sweforge（Py3.12）; 绝对路径:
+      /root/autodl-tmp/conda/envs/sweforge/bin/python
+    - 项目 /root/autodl-tmp/SWE_project/; 运行需 PYTHONPATH=src
+    - vLLM 0.11 + transformers 4.57 + 模型缓存
+      （HF_HOME=/root/autodl-tmp/huggingface; 已缓存 Qwen3-0.6B-Base）
+    - Mac 的 SSH 公钥已装到 AutoDL ~/.ssh/authorized_keys
+      （~/.ssh/autodl_ed25519.pub, 免密登录）; 若重装系统需重装
+
+=====================================================================
+2. 连接步骤（顺序不能乱）
+=====================================================================
+  ① Mac 起 Env Server（Docker 后端, 只监听 127.0.0.1:8500）:
+     注: 本 server 已带连接横幅（AutoDL 首次创建环境时 Mac 终端打印
+     [连接提示]）。Clash 关闭时不需要 NO_PROXY:
+     cd /Users/apple/code/SWE_project
+     PYTHONPATH=src python -m sweforge.env_server.server \
+       --bundles-dir examples --docker --port 8500
+     （若 Clash 开启, 命令前面加 NO_PROXY=127.0.0.1,localhost）
+     自检: curl -s http://127.0.0.1:8500/health  -> {"ok":true}
+
+  ② Mac 建反向隧道（AutoDL 的 127.0.0.1:8500 -> Mac 的 127.0.0.1:8500）:
+     关键: 由于 Mac 在 Clash 代理后不可被 AutoDL 反向 SSH 到,
+     隧道方向是「Mac 主动连 AutoDL 并做 -R 转发」。
+     ssh -o ExitOnForwardFailure=yes -N \
+       -R 8500:127.0.0.1:8500 -i ~/.ssh/autodl_ed25519 \
+       -p 10705 root@connect.cqa1.seetacloud.com
+     （保持终端挂着; 断线要重连。可用 nohup + 自动重连循环,
+       见本文件 §7 的 tunnel_autodl.sh。）
+
+  ③ AutoDL 侧验证隧道通（此时应返回 Mac server 的 health）:
+     curl -s http://127.0.0.1:8500/health     -> {"ok":true}
+
+  ④ AutoDL 侧跑联调脚本（契约直连, 脚本化 policy）:
+     cd /root/autodl-tmp/SWE_project
+     PYTHONPATH=src /root/autodl-tmp/conda/envs/sweforge/bin/python \
+       scripts/interop_mac.py --base-url http://127.0.0.1:8500
+     预期: 7/7 全 OK, 最后 "联调通过" exit 0。
+
+=====================================================================
+3. 真实 LLM 驱动（LLM -> Mac Docker, 已实测）
+=====================================================================
+  用 vLLM 加载模型, LLMPolicy 生成 -> parse -> 动作经隧道打到 Mac Docker。
+  两个注意:
+    - Base / 少量 SFT 的 Qwen3-0.6B 不会稳定输出 <tool_call> JSON,
+      大概率 AGENT_ERROR（管线仍跑通, 属预期）; 要模型真正能修任务,
+      需足够步数的 SFT 训练。
+    - 确定性地验证「LLM policy 管线 -> Docker」用 stub 生成器（见下）。
+
+  A) 真实 LLM（验证管线, 模型未学会格式则 AGENT_ERROR）:
+     python - <<'PYEOF'
+     from sweforge.environment.remote import RemoteEnvironmentBackend
+     from sweforge.rollout.llm_policy import LLMPolicy, VLLMGenerator
+     from sweforge.rollout.loop import SWEForgeAgentLoop
+     from transformers import AutoTokenizer
+     from vllm import LLM
+     # task 用 interop-mac 同款（setup 建 answer.txt + 断言）; 略
+     backend = RemoteEnvironmentBackend(base_url="http://127.0.0.1:8500")
+     model = "/tmp/sweforge-sft-obs/checkpoints/global_step_12/huggingface"
+     tok = AutoTokenizer.from_pretrained(model)
+     llm = LLM(model=model, gpu_memory_utilization=0.3,
+               max_model_len=8192, enforce_eager=True)
+     policy = LLMPolicy(tok, VLLMGenerator(llm, max_tokens=256, temperature=0.0))
+     traj = SWEForgeAgentLoop(backend, policy, max_steps=6).run(task)
+     print(traj.termination_reason, traj.num_turns)
+     PYEOF
+
+  B) 确定性验证（stub 生成器输出合法 <tool_call>, 走真实 parse 管线）:
+     生成器依次返回:
+       <tool_call>{"name":"view_file","arguments":{"path":"answer.txt",
+         "start_line":1,"end_line":3}}</tool_call>
+       <tool_call>{"name":"str_replace","arguments":{"path":"answer.txt",
+         "old_string":"wrong ","new_string":""}}</tool_call>
+       <tool_call>{"name":"finish","arguments":{"summary":"ok"}}</tool_call>
+     预期: termination=agent_finished, turns=3, patch 含 answer.txt 修复,
+     Mac server 日志出现 create/actions×3/patch/destroy。
+
+=====================================================================
+4. Mac Docker 侧证据怎么查（验证真的在容器里执行）
+=====================================================================
+  - Mac server 日志（启动时重定向到文件）:
+      tail -f /tmp/sweforge_mac_server.log
+      应看到 POST /v1/envs、/actions、/patch、/verify、DELETE 逐条 200。
+  - 运行中容器（若想看动作执行瞬间）:
+      docker ps --filter label=sweforge.managed=true
+  - 容器详情（image/network/user/labels）:
+      docker inspect <cname> --format \
+        'Image={{.Config.Image}} Network={{.HostConfig.NetworkMode}} User={{.Config.User}}'
+  - 泄漏检查（正常应空）:
+      docker ps -a --filter label=sweforge.managed=true
+      清理泄漏: docker ps -aq --filter label=sweforge.managed=true | xargs -r docker rm -f
+
+=====================================================================
+5. 容量参考（Mac colima: 4 CPU / 8GB VM）
+=====================================================================
+  - 每容器空闲基线 ~0.6 MiB; pytest 峰值 ~30 MiB (ru_maxrss)
+  - 内存维度并发上限 ~126 个 rollout 容器; 留 50% 余量建议 ~63 个
+  - CPU(VM 4 核, 每容器最多 2 核) 与 pids-limit(128) 也是约束
+  - 详细实测见 docs/docker_e2e_test.log
+
+=====================================================================
+6. 真实 GRPO rollout 怎样操作（现状 + 到正式 verifier reward 的路径）
+=====================================================================
+  现状（已能跑）: 阶段 12 smoke_grpo.py 用格式奖励（rl_reward_toolcall.py,
+  canonical 解析判据 0/1）; rollout 用 Mock 后端, 不碰 Mac。这是
+  「GRPO 训练管线」验证, 不是「GRPO verifier reward 来自 Mac Docker」。
+
+  正式路径（未接线, 需你同意才改 AutoDL 代码）:
+    ① AutoDL 侧把 rollout 后端从 Mock 换成 RemoteEnvironmentBackend
+       (base_url=http://127.0.0.1:8500), 让 agent 动作打到 Mac Docker。
+    ② reward 函数(rl_reward_toolcall.py 或新文件)里, 对每条轨迹:
+       - 收集轨迹 patch（traj.patch）
+       - 调 Mac POST /v1/verifications {task, patch}
+       - 返回 dict {"score": resolved?1:0, "resolve":..., "f2p":...,
+         "p2p":...}（verl custom reward 约定, 额外键自动进 val-aux 曲线）
+    ③ smoke_grpo.py 的 REWARD_PY 指向新 reward 文件。
+    ④ 此时需 AutoDL 侧 `pip` 依赖 httpx（RemoteEnvironmentBackend 用）,
+       以及环境变量 NO_PROXY（若 AutoDL 也有代理拦 127.0.0.1）。
+    ⑤ 跑:
+       python scripts/smoke_grpo.py --steps 2 --batch 4 --n 2 \
+         --out-dir /root/autodl-tmp/sweforge-grpo-obs
+       （观察 val-core/reward 曲线 -> 来自真实 resolve/f2p/p2p）
+
+  注意: 阶段 15 正式实验按你之前决定取消; 上面是「激活正式 verifier
+  reward」的接线说明, 不擅自改。
+
+=====================================================================
+7. 常用命令速查
+=====================================================================
+  Mac 起 server（Clash 关闭时无需 NO_PROXY）:
+    cd /Users/apple/code/SWE_project
+    PYTHONPATH=src python -m sweforge.env_server.server \
+      --bundles-dir examples --docker --port 8500
+
+  Mac 起反向隧道（带自动重连）:
+    /tmp/tunnel_autodl.sh   （内容见下方注释; nohup 挂在后台即可）
+
+  AutoDL 跑联调:
+    cd /root/autodl-tmp/SWE_project
+    PYTHONPATH=src /root/autodl-tmp/conda/envs/sweforge/bin/python \
+      scripts/interop_mac.py --base-url http://127.0.0.1:8500
+
+  免密登录 AutoDL（Mac 上）:
+    ssh -i ~/.ssh/autodl_ed25519 -p 10705 root@connect.cqa1.seetacloud.com
+
+  -- tunnel_autodl.sh 内容（Mac 侧） --
+  #!/bin/bash
+  for i in $(seq 1 1000); do
+    ssh -o BatchMode=yes -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=15 -i ~/.ssh/autodl_ed25519 \
+        -N -R 8500:127.0.0.1:8500 -p 10705 root@connect.cqa1.seetacloud.com
+    sleep 3
+  done
+
+=====================================================================
+8. 两端「连接提示」机制（2026-08-09 新增）
+=====================================================================
+  问题: 「两端连接上（LLM 能操作 Mac Docker coding 环境）时, 两端终端
+  有什么输出/提示?」
+
+  Mac 侧（已实现; Mac 自有代码 src/sweforge/env_server/server.py,
+  新增 connection_banner_app 中间件）:
+    AutoDL 第一次 POST /v1/envs（即 LLM 可操作 Docker 环境）时, Mac
+    终端打印一次横幅（写到 stderr, 立即刷新）:
+      ================================================================
+        [连接提示] AutoDL 已通过隧道连接到 Mac Docker!
+        LLM 现在可以操作 Mac 的 Docker coding 环境。
+        时间: YYYY-MM-DD HH:MM:SS
+      ================================================================
+    之后每个请求（actions/patch/verify/destroy）由 uvicorn 访问日志
+    逐条展示（如 "POST /v1/envs/xxx/actions ... 200 OK"）。
+
+  AutoDL 侧（驱动脚本自带输出, 未改 AutoDL 代码）:
+    interop_mac.py / LLMPolicy 驱动脚本会打印 health、每步动作、
+    agent_finished、turns、patch、validate_trajectory 结果, 即 AutoDL
+    终端的连接提示。若 AutoDL 团队想要更显式的「已连接 Mac Docker」
+    横幅, 可在其 remote.py 构造时或驱动脚本加一行打印——按铁律
+    Mac 不代改 AutoDL 代码, 需 AutoDL 侧自己加（Mac 可提供建议行）。
+
+  本次实录（两端终端全部命令+输出, 已标注【命令】/【输出】/块目的）:
+    docs/两端连接实录_2026-08-09_clashoff.txt
+
+=====================================================================
+ 附: 本次会话已建立的进程（2026-08-09 00:35, 结束时可自行清理）
+   - Mac server: python -m sweforge.env_server.server ... --port 8500
+                 （带连接横幅; 当前 pid 40883, 日志 /tmp/sweforge_mac_server_banner.log）
+   - Mac 隧道  : /tmp/tunnel_autodl.sh (反向 ssh -R 8500)
+  清理: pkill -f "sweforge.env_server.server"; pkill -f tunnel_autodl.sh
+=====================================================================

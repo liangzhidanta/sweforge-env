@@ -143,9 +143,83 @@ def test_str_replace_empty_old_creates_file(tmp_path):
     assert executor.read_text("new.txt") == "hello"
 
 
+def test_str_replace_creates_file_in_missing_dir(tmp_path):
+    executor = _executor(tmp_path)
+    observation = execute_action(
+        executor, StrReplaceAction(path="pkg/__init__.py", old_string="", new_string="")
+    )
+    assert observation.success is True
+    assert executor.read_text("pkg/__init__.py") == ""
+
+
+def test_str_replace_write_error_is_observation(tmp_path):
+    executor = _executor(tmp_path)
+    # 父路径 a.py 是文件, 不是目录 -> write_text 的 mkdir 抛 OSError;
+    # 必须返回 observation 而非向上抛（否则 ASGI 500 杀 rollout）
+    observation = execute_action(
+        executor, StrReplaceAction(path="a.py/child.txt", old_string="", new_string="x")
+    )
+    assert observation.success is False
+    assert observation.error
+
+
 def test_str_replace_escape(tmp_path):
     observation = execute_action(
         _executor(tmp_path), StrReplaceAction(path="../secret.txt", old_string="x", new_string="y")
     )
     assert observation.success is False
     assert observation.error is not None
+
+
+# ---------------- 绝对路径归一化（2026-08-11 补丁） ----------------
+
+def test_view_file_absolute_inside_workspace(tmp_path):
+    """工作区内绝对路径 -> 归一为相对路径 -> 成功。"""
+    observation = execute_action(
+        _executor(tmp_path), ViewFileAction(path=f"{tmp_path}/a.py")
+    )
+    assert observation.error is None
+    assert "def get_or_compute" in observation.content
+    assert observation.total_lines == 2
+
+
+def test_view_file_absolute_outside_rejected(tmp_path):
+    """工作区外绝对路径 -> None -> 沿用 must be relative 文案。"""
+    observation = execute_action(_executor(tmp_path), ViewFileAction(path="/etc/hostname"))
+    assert observation.error is not None
+    assert "must be relative to the task workspace" in observation.error
+    assert observation.start_line == 0
+
+
+def test_view_file_absolute_traversal_outside_rejected(tmp_path):
+    """绝对路径带 .. 指到工作区外 -> 仍被拒绝（不绕过; 文案是 path escapes）。"""
+    observation = execute_action(
+        _executor(tmp_path), ViewFileAction(path=f"{tmp_path}/../secret.txt")
+    )
+    assert observation.error is not None
+    assert observation.start_line == 0
+
+
+def test_str_replace_absolute_inside_workspace(tmp_path):
+    executor = _executor(tmp_path)
+    observation = execute_action(
+        executor,
+        StrReplaceAction(path=f"{tmp_path}/a.py", old_string="return key", new_string="return key.upper()"),
+    )
+    assert observation.success is True
+    assert executor.read_text("a.py") == "def get_or_compute(key):\n    return key.upper()\n"
+
+
+def test_search_absolute_inside_returns_relative_paths(tmp_path):
+    observation = execute_action(
+        _executor(tmp_path), SearchAction(query="get_or_compute", path=f"{tmp_path}/a.py")
+    )
+    assert len(observation.matches) == 1
+    assert observation.matches[0].path == "a.py"  # 观测里的路径是相对, 不带绝对前缀
+
+
+def test_search_absolute_outside_rejected(tmp_path):
+    observation = execute_action(_executor(tmp_path), SearchAction(query="x", path="/etc/hostname"))
+    assert observation.matches == []
+    assert observation.error is not None
+    assert "must be relative" in observation.error

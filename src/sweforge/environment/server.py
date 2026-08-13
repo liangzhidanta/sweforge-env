@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+import uuid
 from collections import OrderedDict
 from typing import Any, Callable
 
@@ -106,8 +107,11 @@ def make_app(
                 raise HTTPException(
                     status_code=422, detail="body must carry 'task' or 'task_id'"
                 )
-            envs[task.task_id] = backend.create(task)
-            return {"env_id": task.task_id}
+            # env_id 每次 create 唯一（并发同 task_id 会互相覆盖）; 只动 env_id,
+            # task.task_id 保持原值 —— bundle 查找 / verify 走原 task_id 不受影响
+            env_id = f"{task.task_id}-{uuid.uuid4().hex[:8]}"
+            envs[env_id] = backend.create(task)
+            return {"env_id": env_id}
 
         return _idempotent("POST", "/v1/envs", body.get("request_id"), _do)
 

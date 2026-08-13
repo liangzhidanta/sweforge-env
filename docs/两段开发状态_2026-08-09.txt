@@ -1,0 +1,185 @@
+=====================================================================
+ SWE-Forge 两端开发状态总结（AutoDL 侧 + Mac 侧）
+ 生成: 2026-08-09 00:10 CST  (Mac 本机)
+ 数据来源: AutoDL 服务器 /root/autodl-tmp/SWE_project/（SSH 实连读取）
+           + Mac 本机 /Users/apple/code/SWE_project
+=====================================================================
+
+0. 一句话总览
+---------------------------------------------------------------------
+  AutoDL 侧（模型/SFT/GRPO/数据管道）已到「阶段 17: 可观测性」完成,
+  327 个测试全过, SFT 与 GRPO 真实冒烟都跑通; 数据管道(阶段 13-16:
+  Data Factory -> Funnel -> Profiling -> Flywheel)全链路已跑通。
+  Mac 侧（执行环境）M1 完成且超出范围: §8 契约 server + 真实 Docker
+  容器 + clean verify + 并发容量实测全部落地, 158 个测试全过, ruff 干净。
+  两端联调脚本 interop_mac.py 已在本机全链路 exit 0。
+  当前两端均无 blocker; 都停在「等用户确认下一步」的 checkpoint。
+
+=====================================================================
+1. AutoDL 侧状态（/root/autodl-tmp/SWE_project/）
+=====================================================================
+  服务器: autodl-container-3916478324-b5561f9c (x86_64 Ubuntu)
+  硬件  : RTX 4090 D 24GB（当前空闲, 1MiB 占用）, CUDA 13.2
+  环境  : conda env `sweforge`, Python 3.12.13（绝对路径 python:
+          /root/autodl-tmp/conda/envs/sweforge/bin/python）
+  Git   : main 分支干净; 最新提交 600ba81
+          「feat: 阶段 17 §11 可观测性落地 + usage.txt 使用说明
+          （全量回归 327 passed）」
+  测试  : 327 passed（2026-08-08 全量回归 10m39s）
+
+  CURRENT_STAGE = 阶段 17 完成（§11 可观测性, 2026-08-08）。
+  已完成里程碑（按 git 历史）:
+    阶段 5-8   EnvironmentBackend 接口/Mock/Remote + §8 契约 server
+               + AutoDL 联调
+    阶段 9     Clean Verifier（reward/verifier.py, P4/P5）
+    阶段 10    Multi-turn Rollout（LLMPolicy + SWEForgeAgentLoop）
+    阶段 11    SFT smoke 真实训练跑通（veRL sft_trainer, Qwen3-0.6B）
+    阶段 12    GRPO smoke 跑通（veRL main_ppo + vLLM rollout, 2 步）
+               + verl 问题清单 VERL_ISSUES_STAGE12.txt（7 个阻塞点已解）
+    阶段 13    Data Factory 任务池自动生成（reversal + 6 类 AST mutation）
+    阶段 14    Difficulty Profiling / Priority Pool（链路跑通）
+    阶段 16    Data Flywheel 链路（22 节规格: 三来源 Mixed TaskSource /
+               PublicTaskSource / AST Mutation 增强(coverage-gated) /
+               Funnel 按来源 / §12 优先级平衡 / §19 污染检查 /
+               §14-16 失败分类+分析+生成器自适应权重 / §17 轮次脚本 /
+               §21 验收 A-F）
+    阶段 17    §11 可观测性 observability/ 模块（不改 verl, 复用其
+               Tracking 后端: metrics/system/render/observer; SFT 12 步
+               5 series + GRPO 2 步 10 series, PNG 曲线 + TensorBoard
+               + system.jsonl 全验证; GRPO 显存修复链已实测记录）
+
+  已落盘产物（artifacts/）:
+    data_funnel.json|csv    （7 groups 全 verified）
+    overlap_report.json     （train vs public 全 disjoint）
+    profiled.jsonl          （阶段 14 产物）
+    priority_pool.jsonl
+    flywheel_stats.json     （stub 信号: 6 AST 不可解 + 1 reversal easy）
+    observability/sft_training_curves.png
+    observability/grpo_training_curves.png
+    usage_demo/usage_demo.log  （全流程演示实录）
+
+  NEXT_ACTION（AutoDL 侧自己的待办, 来自其 CLAUDE.md）:
+    1. 阶段 17 已落地并 commit; 待全量回归确认。
+    2. 阶段 15（正式实验）保持取消。正式 flywheel 轮等真实 policy
+       （--policy vllm）激活; 当前为默认权重 0.50/0.20/0.30,
+       stub 信号未持久化。
+    3. 数据规模化（§13: 3-5 repo / 300-600 候选 / 100-250 verified）
+       待用户确认种子 repo 方案后启动; 训练侧仍取消。
+
+=====================================================================
+2. Mac 侧状态（/Users/apple/code/SWE_project, 包 sweforge-env）
+=====================================================================
+  机器  : macOS arm64 (Apple Silicon), colima Docker VM (4 CPU / 8GB,
+          aarch64 Ubuntu 24.04, runtime=docker)
+  环境  : base conda env（/opt/homebrew/Caskroom/miniconda/base,
+          Python 3.12）; 脚本用 PYTHONPATH=src
+  Git   : master 分支; 最新提交 0eca703
+          「docs: show a real coding-env container (raw docker I/O)
+          and concurrent real dockers」
+  测试  : 158 tests collected, 全过; ruff 干净
+
+  已完成里程碑（M1 完成 + 超出 M2 范围提前落地）:
+    - AutoDL canonical 契约逐字节 vendor 进
+      src/sweforge/{schemas,protocol,environment,reward,agent}/
+      （VENDORED.md; 这些文件绝不改动）
+    - LocalDockerBackend 实现 canonical EnvironmentBackend
+      （create/reset/execute/export_patch/verify/destroy; env_id==task_id）
+    - 五工具(bash/search/view_file/str_replace/finish) + clean verifier
+      （全新工作区注入隐藏 F2P 测试; P4 干净验证）
+    - DockerExecutor: 每 env 一个非 root(--user 1000:1000)、
+      --network none 容器; tar+`docker cp` 注入仓库快照
+      （已修 AppleDouble `._*` 污染: 用 Python tarfile 打种子包）
+    - §8 FastAPI server（vendored make_app + --docker/--token/
+      --cleanup-stale/--image 参数）; 端口 8500 只监听 127.0.0.1
+    - Bearer auth（可选 --token）+ AuthenticatedRemoteEnvironmentBackend
+      参考客户端
+    - per-task 镜像解析（task.environment.image 优先）
+    - Docker stale container 清理（manager.cleanup_stale_containers）
+    - interop_mac.py 全链路本机 exit 0（local + docker 双后端）;
+      demo_rollout --docker -> verdict=resolved reward=1.0
+    - 本机 Docker E2E log（docs/docker_e2e_test.log）: 真实 coding
+      环境容器 + 5 容器并发真实交互实测（墙钟 4.2s << 串行 7.6s,
+      docker ps/top/stats 证明并行）; 容量推测: 内存维度并发上限
+      ~126 个 rollout 容器, 留 50% 余量建议 ~63 个
+      （CPU 4 核与每容器 pids-limit 128 也是约束）
+
+  NEXT_ACTION（Mac 侧待办, 来自 USAGE.txt 与设计 spec）:
+    1. 与 AutoDL 侧「跨机 SSH tunnel + 真机 AutoDL host 对接」还没
+       在真机上做（本机只做了模拟/本地全链路）。
+    2. Task Registry（Mac 私有 secrets）仍是简化版（bundles_dir）。
+    3. Clean Verifier 已服务化为 /v1/verifications; 若要改造成独立
+       服务可再做。
+
+=====================================================================
+3. 两端联动 / 契约对齐（本次实连核对）
+=====================================================================
+  §8 契约: AutoDL Agent -> RemoteEnvironmentBackend -> HTTP(SSH tunnel)
+            -> Mac server(127.0.0.1:8500) -> Docker 容器。
+            AutoDL 侧只依赖 EnvironmentBackend 接口, 不碰 Docker。
+
+  契约文件一致性核对（13 个关键文件 md5 对比）:
+    schemas/trajectory.py, schemas/verification.py,
+    protocol/tools.py, protocol/messages.py, protocol/system_prompt.py,
+    protocol/serialization.py, protocol/validate.py,
+    environment/base.py, environment/remote.py, environment/server.py,
+    reward/verifier.py, agent/loop.py
+      -> 12 个文件 md5 完全一致（byte-for-byte）。
+
+    差异文件: src/sweforge/schemas/task.py
+      -> AutoDL 侧已更新（阶段 16 加了两个东西）:
+         ① 新增 TaskSource = Literal["PUBLIC_EXECUTABLE",
+            "AST_MUTATION", "REPAIR_REVERSAL"]
+         ② MutationInfo 增加 entity / reference_state / target_index
+            （AST_MUTATION 增强的 private metadata, 禁止进 policy prompt）
+      -> Mac 侧 vendored 副本还是旧版。
+      ⚠ 注意: 按铁律 Mac 侧 vendor 文件不可直接改; 需要把 AutoDL 侧
+        新 task.py 重新 vendor 进 Mac（逐字节拷贝）, 或等 AutoDL 侧
+        确认 schema 稳定后再同步。这是两端当前唯一的契约漂移点。
+
+  认证: AutoDL 侧 remote.py 目前**没有** Authorization/Bearer 请求头
+        （grep 为空）。若 Mac server 开 --token, AutoDL 侧 remote.py
+        _request() 需加一行头（USAGE.txt §4 已写好参考）。
+
+  联调脚本: scripts/interop_mac.py（AutoDL 侧源码）已在 Mac 本机跑过
+            exit 0。真机跨机 SSH tunnel 尚未实测。
+
+=====================================================================
+4. 两端关键数字对照表
+=====================================================================
+  维度            AutoDL 侧               Mac 侧
+  --------------  ----------------------  --------------------------
+  最新阶段        阶段 17 可观测性        M1 完成 + M2 部分提前落地
+  测试           327 passed              158 passed（+ ruff clean）
+  最新提交        600ba81                 0eca703
+  Python          3.12.13 (conda)        3.12 (base conda)
+  GPU/容器        RTX 4090 D 24GB(空闲)  colima VM 4C/8GB + Docker
+  训练            SFT smoke 12步 + GRPO smoke 2步 跑通
+                  （Qwen3-0.6B, veRL 0.8.0）
+  数据管道        13-16 全链路跑通        7 任务 bundle + 隐藏 F2P
+                  （7 verified tasks）    （toy_cache_aliasing）
+  契约            13 文件 12 个一致       task.py 一处待重新 vendor
+  联调            interop_mac.py         interop_mac.py 本机 exit 0
+                  在 AutoDL 侧源码里      （真机 tunnel 未测）
+
+=====================================================================
+5. 两端各自的下一步（待用户确认）
+=====================================================================
+  AutoDL 侧:
+    - 正式 flywheel 轮等真实 policy（--policy vllm）激活
+    - 数据规模化: 选种子 repo（3-5 repo / 300-600 候选）后启动
+    - 训练侧（SFT/GRPO 正式训练）仍取消, 等决定
+
+  Mac 侧:
+    - 与 AutoDL 真机建立 SSH tunnel 做跨机联调（AutoDL 侧 remote.py
+      补认证头那行后即可）
+    - 把 AutoDL 侧更新的 schemas/task.py 重新 vendor 进 Mac, 消除
+      契约漂移
+
+  两端共同:
+    - 跑一次「AutoDL 真机 -> SSH tunnel -> Mac server -> Docker 容器」
+      的真实 E2E, 替代目前的本地模拟
+
+=====================================================================
+ 附: 本次连接的服务器信息已存本机 AUTODL_SSH.txt（已加入 .gitignore,
+     不会提交到 git）; 密码为先前提供的 Wsh123123123。
+=====================================================================

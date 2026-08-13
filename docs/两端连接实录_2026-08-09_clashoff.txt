@@ -1,0 +1,157 @@
+=====================================================================
+ SWE-Forge 两端连接实录（Clash 关闭后重连 + 终端提示演示）
+ 记录日期: 2026-08-09 00:35 CST（Mac 本机汇总）
+ 拓扑: AutoDL Agent -> RemoteEnvironmentBackend -> HTTP
+       -> 反向 SSH tunnel -> Mac Environment Server(127.0.0.1:8500)
+       -> Docker 容器（每 env 一个, --network none, --user 1000:1000）
+ 说明: 本文件记录本次会话「两端终端的全部命令与输出」。
+       命令标【命令】, 输出标【输出】, 每块开头标【目的】。
+=====================================================================
+
+===== 块 1: 前置确认（Clash 关闭后的网络状态） =====
+【目的】验证用户关闭 Clash 后系统代理是否真的关闭; 判断连接是否更简单。
+
+【命令】scutil --proxy; env | grep -i proxy; ps aux | grep -iE "verge|mihomo|clash"
+【输出】
+  HTTPEnable : 0            <- 系统 HTTP 代理已关闭
+  HTTPSEnable : 0
+  SOCKSEnable : 0
+  ProxyAutoConfigEnable : 0
+  （env 无 proxy 变量）
+  /Applications/Clash Verge.app/.../clash-verge     <- 应用进程仍在
+  /Applications/Clash Verge.app/.../verge-mihomo    <- 内核进程仍在
+
+【结论】系统代理确已关闭（HTTPEnable=0）。Clash 应用进程虽未退出但不再
+拦截 127.0.0.1 -> Mac 侧命令无需再加 NO_PROXY（实测 curl 直接通）。
+但 Mac 是内网 IP(10.21.190.41)、无 SSH 服务, 反向隧道仍必须——
+「关 Clash」只是省掉 NO_PROXY, 并不会让连接拓扑变简单。
+
+===== 块 2: Mac 端启动带「连接提示」横幅的 Env Server =====
+【目的】启动 Mac Environment Server（本轮已给 Mac 自有代码加连接横幅:
+AutoDL 首次创建环境时在 Mac 终端打印提示）。Clash 已关, 命令不加 NO_PROXY。
+
+【命令】(Mac 后台) PYTHONPATH=src python -m sweforge.env_server.server \
+    --bundles-dir examples --docker --port 8500 \
+    > /tmp/sweforge_mac_server_banner.log 2>&1 &
+【输出】(curl 自检)
+  {"ok":true}
+  INFO: Uvicorn running on http://127.0.0.1:8500 (Press CTRL+C to quit)
+
+===== 块 3: AutoDL 端验证隧道 + 全链路联调（interop_mac.py 7/7） =====
+【目的】从 AutoDL 侧经反向隧道访问 Mac server, 跑 §8 契约联调; 观察
+Mac 终端是否打印连接横幅。
+
+【命令】(AutoDL) curl -s http://127.0.0.1:8500/health
+【输出】
+  {"ok":true}
+
+【命令】(AutoDL) cd /root/autodl-tmp/SWE_project && PYTHONPATH=src \
+  /root/autodl-tmp/conda/envs/sweforge/bin/python scripts/interop_mac.py \
+  --base-url http://127.0.0.1:8500
+【输出】
+  == SWE-Forge 阶段 8 联调: AutoDL -> Mac Environment Server (§8) ==
+  == base_url: http://127.0.0.1:8500
+  [1/7] health             OK
+  [2/7] register_task      OK (task_id=interop-demo)
+  [3/7] create(task_id 引用)OK (env_id=interop-demo)
+  [4/7] 五工具逐条        OK (bash/view/search/str_replace/finish)
+  [5/7] export_patch       OK (2 file(s) changed)
+  [6/7] verify             OK (verdict=resolved, F2P=1, P2P=1)
+  [7/7] agent loop         OK (turns=3, term=agent_finished, trajectory 通过 validate_trajectory)
+  (空行)
+  == 联调通过: AutoDL 客户端 <-> Environment Server 全链路 OK ==
+
+【命令】(Mac) tail /tmp/sweforge_mac_server_banner.log
+【输出】（Mac 终端出现连接横幅, 随后每个请求由 uvicorn 日志逐条展示）
+  ================================================================
+    [连接提示] AutoDL 已通过隧道连接到 Mac Docker!
+    LLM 现在可以操作 Mac 的 Docker coding 环境。
+    时间: 2026-08-09 00:34:35
+  ================================================================
+  INFO: ... "POST /v1/envs HTTP/1.1" 200 OK
+  INFO: ... "POST /v1/envs/interop-demo/actions HTTP/1.1" 200 OK   x5
+  INFO: ... "GET /v1/envs/interop-demo/patch HTTP/1.1" 200 OK
+  INFO: ... "DELETE /v1/envs/interop-demo?... HTTP/1.1" 200 OK
+  INFO: ... "POST /v1/verifications HTTP/1.1" 200 OK
+  INFO: ... "POST /v1/envs HTTP/1.1" 200 OK                        (agent loop)
+  INFO: ... "POST /v1/envs/interop-demo/actions HTTP/1.1" 200 OK   x3
+  INFO: ... "GET /v1/envs/interop-demo/patch HTTP/1.1" 200 OK
+  INFO: ... "DELETE /v1/envs/interop-demo?... HTTP/1.1" 200 OK
+
+===== 块 4: LLMPolicy(parse 管线) -> 隧道 -> Mac Docker（stub 生成器） =====
+【目的】用 stub 生成器输出合法 <tool_call> 文本, 走 LLMPolicy 真实 parse
+管线, 证明「LLM 文本 -> 工具调用 -> 动作经隧道打到 Mac Docker 容器」全链路;
+Mac 终端同时再次打印连接提示。
+
+【命令】(AutoDL) cd /root/autodl-tmp/SWE_project && PYTHONPATH=src \
+  /root/autodl-tmp/conda/envs/sweforge/bin/python - < /tmp/llm_policy_to_docker.py
+【输出】
+  health: True
+  == LLMPolicy parse 管线 -> Mac Docker ==
+  termination: agent_finished
+  turns: 3
+    [0] view_file (path=answer.txt) -> obs=yes
+    [1] str_replace (path=answer.txt old='wrong ' new='') -> obs=yes
+    [2] finish (summary='removed wrong prefix') -> obs=None
+  patch: 'diff --git a/answer.txt b/answer.txt\nindex b812cc3..9d908d4 100644\n--- a/answer.txt\n+++ b/answer.txt'
+  == 通过 validate_trajectory ==
+
+【命令】(Mac) tail /tmp/sweforge_mac_server_banner.log
+【输出】（server 为演示已重启, 横幅再次打印, 紧接 LLM 三个动作）
+  ================================================================
+    [连接提示] AutoDL 已通过隧道连接到 Mac Docker!
+    LLM 现在可以操作 Mac 的 Docker coding 环境。
+    时间: 2026-08-09 00:34:53
+  ================================================================
+  INFO: ... "POST /v1/envs HTTP/1.1" 200 OK
+  INFO: ... "POST /v1/envs/interop-demo/actions HTTP/1.1" 200 OK   x3
+  INFO: ... "GET /v1/envs/interop-demo/patch HTTP/1.1" 200 OK
+  INFO: ... "DELETE /v1/envs/interop-demo?... HTTP/1.1" 200 OK
+
+===== 块 5: 真实 LLM(vLLM + SFT ckpt) 驱动（本次遇 GPU 被占用） =====
+【目的】尝试真实 LLM 驱动 rollout 经隧道打到 Mac Docker。本次启动失败,
+原因不是连接, 而是 AutoDL GPU 正被另一进程（SFT 训练）占满。
+
+【命令】(AutoDL) cd /root/autodl-tmp/SWE_project && PYTHONPATH=src \
+  /root/autodl-tmp/conda/envs/sweforge/bin/python - < /tmp/real_llm_docker.py
+【输出】（health 通过; vLLM 申请显存失败）
+  health: True
+  ...
+  ValueError: Free memory on device (0.48/23.52 GiB) on startup is less than
+  desired GPU memory utilization (0.3, 7.06 GiB). Decrease GPU memory
+  utilization or reduce GPU memory used by other processes.
+  RuntimeError: Engine core initialization failed. See root cause above.
+
+【命令】(AutoDL) nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv; ps aux | grep sft
+【输出】
+  24564 MiB, 20242 MiB, 3842 MiB
+  python scripts/smoke_sft.py --model ...          <- SFT 训练进程
+  python -u .../scripts/sft_lora_entry.py          <- 占用 20232 MiB GPU
+
+【结论】AutoDL GPU 当前被 SFT 训练占用, 真实 LLM rollout 需等训练结束或
+调低 gpu_memory_utilization 后重试——属服务端资源问题, 非连接问题。
+（历史记录: Base / 12 步 SFT 模型也未学会输出 <tool_call>, 会 AGENT_ERROR,
+属模型能力问题; 连接管线本身已由块 3、块 4 证明可用。）
+
+===== 块 6: 两端「连接提示」机制说明 =====
+【目的】回答用户「两端连接上（LLM 能操作 Mac Docker）时终端有什么提示」。
+
+Mac 侧（已实现; Mac 自有代码, 改动在
+  src/sweforge/env_server/server.py 的 connection_banner_app）:
+  AutoDL 第一次 POST /v1/envs（即 LLM 可操作 Docker 环境）时, Mac 终端
+  打印一次:
+    ================================================================
+      [连接提示] AutoDL 已通过隧道连接到 Mac Docker!
+      LLM 现在可以操作 Mac 的 Docker coding 环境。
+      时间: YYYY-MM-DD HH:MM:SS
+    ================================================================
+  之后每个请求（actions/patch/verify）由 uvicorn 访问日志逐条展示。
+
+AutoDL 侧（驱动脚本自带输出, 无需改）:
+  interop_mac.py / LLMPolicy 驱动脚本会打印 health / 每步动作 /
+  agent_finished / turns / patch / validate_trajectory 等, 这就是
+  AutoDL 终端的连接提示。
+  若 AutoDL 团队想要更显式的「已连接 Mac Docker」横幅, 可在其
+  remote.py 构造时或驱动脚本里加一行打印——按铁律 Mac 不代改
+  AutoDL 代码, 需 AutoDL 侧自己改（Mac 可提供建议行）。
+=====================================================================

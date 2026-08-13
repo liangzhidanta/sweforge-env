@@ -82,7 +82,7 @@ def test_authenticated_full_flow(auth_server):
     client = AuthenticatedRemoteEnvironmentBackend(base_url=auth_server, token=TOKEN, max_retries=1)
     try:
         env_id = client.create(_task(task_id="with-token"))
-        assert env_id == "with-token"
+        assert env_id.startswith("with-token-")
         obs = client.execute(env_id, BashAction(command="cat answer.txt"))
         assert obs.stdout.strip() == "the wrong answer"
         obs = client.execute(env_id, StrReplaceAction(path="answer.txt", old_string="wrong ", new_string=""))

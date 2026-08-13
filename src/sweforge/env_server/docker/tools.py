@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Callable
 
 from sweforge.env_server.docker.executors import Executor
@@ -35,6 +36,26 @@ from sweforge.protocol.tools import (
 _MAX_SEARCH_MATCHES = 200
 #: bash 默认超时（秒）
 _DEFAULT_BASH_TIMEOUT = 60.0
+
+#: 与 path_policy.PathPolicy.resolve 拒绝绝对路径的文案保持一致
+_MUST_BE_RELATIVE = "path must be relative to the task workspace"
+
+
+def _relpath_or_none(path: str, workspace_root: Path) -> str | None:
+    """绝对路径 -> 工作区内相对路径; 工作区外返回 None（保持原拒绝语义）。
+
+    相对路径原样返回（契约不变）。绝对路径在工作区内（如 /workspace/a.py）
+    归一为相对路径, 进入工作区后由 PathPolicy 以 root 为基准解析; 工作区外
+    （如 /app/...、/home/runner/...）返回 None -> 沿用 "must be relative" 错误,
+    模型由此学不到错误前缀, 只会学到工作区内的写法。
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        return path
+    try:
+        return str(p.relative_to(workspace_root))
+    except ValueError:
+        return None
 
 
 def execute_action(
@@ -72,16 +93,19 @@ def _search(executor: Executor, action: SearchAction) -> SearchObservation:
         return SearchObservation(matches=[], error=f"invalid regex: {e}")
 
     if action.path:
+        rel = _relpath_or_none(action.path, executor.root)
+        if rel is None:
+            return SearchObservation(matches=[], error=_MUST_BE_RELATIVE)
         try:
-            kind = executor.path_stat(action.path)
+            kind = executor.path_stat(rel)
         except ValueError as e:
             return SearchObservation(matches=[], error=str(e))
         if kind is None:
             return SearchObservation(matches=[], error=f"path not found: {action.path}")
         if kind == "file":
-            files = [action.path]
+            files = [rel]
         else:
-            files = [rel for rel in executor.list_files(action.path) if rel]
+            files = [child for child in executor.list_files(rel) if child]
     else:
         files = executor.list_files(".")
 
@@ -102,8 +126,13 @@ def _search(executor: Executor, action: SearchAction) -> SearchObservation:
 
 
 def _view_file(executor: Executor, action: ViewFileAction) -> ViewFileObservation:
+    rel = _relpath_or_none(action.path, executor.root)
+    if rel is None:
+        return ViewFileObservation(
+            path=action.path, start_line=0, end_line=0, content="", error=_MUST_BE_RELATIVE
+        )
     try:
-        kind = executor.path_stat(action.path)
+        kind = executor.path_stat(rel)
     except ValueError as e:
         return ViewFileObservation(
             path=action.path, start_line=0, end_line=0, content="", error=str(e)
@@ -118,7 +147,7 @@ def _view_file(executor: Executor, action: ViewFileAction) -> ViewFileObservatio
             path=action.path, start_line=0, end_line=0, content="",
             error=f"is a directory: {action.path}",
         )
-    lines = executor.read_text(action.path).splitlines()
+    lines = executor.read_text(rel).splitlines()
     total = len(lines)
     start = action.start_line or 1
     end = action.end_line or total
@@ -141,18 +170,24 @@ def _view_file(executor: Executor, action: ViewFileAction) -> ViewFileObservatio
 
 
 def _str_replace(executor: Executor, action: StrReplaceAction) -> StrReplaceObservation:
+    rel = _relpath_or_none(action.path, executor.root)
+    if rel is None:
+        return StrReplaceObservation(success=False, path=action.path, error=_MUST_BE_RELATIVE)
     if action.old_string == "":
         # empty old_string: 在文件开头插入 new_string; 文件不存在则以 new_string 创建
         try:
-            existing = executor.read_text(action.path)
+            existing = executor.read_text(rel)
         except ValueError as e:
             return StrReplaceObservation(success=False, path=action.path, error=str(e))
         except OSError:
             existing = ""
-        executor.write_text(action.path, action.new_string + existing)
+        try:
+            executor.write_text(rel, action.new_string + existing)
+        except OSError as e:
+            return StrReplaceObservation(success=False, path=action.path, error=str(e))
         return StrReplaceObservation(success=True, path=action.path)
     try:
-        content = executor.read_text(action.path)
+        content = executor.read_text(rel)
     except ValueError as e:
         return StrReplaceObservation(success=False, path=action.path, error=str(e))
     except OSError:
@@ -167,5 +202,8 @@ def _str_replace(executor: Executor, action: StrReplaceAction) -> StrReplaceObse
             success=False, path=action.path,
             error=f"old_string not unique ({count} occurrences)",
         )
-    executor.write_text(action.path, content.replace(action.old_string, action.new_string))
+    try:
+        executor.write_text(rel, content.replace(action.old_string, action.new_string))
+    except OSError as e:
+        return StrReplaceObservation(success=False, path=action.path, error=str(e))
     return StrReplaceObservation(success=True, path=action.path)

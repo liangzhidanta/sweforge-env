@@ -1,0 +1,200 @@
+SWE-Forge 正式 GRPO 操作流程
+版本：2026-08-10
+
+一、当前状态与结论
+
+1. 已经验证通过的部分
+- AutoDL → SSH 反向隧道 → Mac Environment Server → 本机 Docker → CleanVerifier：7/7 通过。
+- 0.6B 模型已完成真实多轮 AgentLoop、Docker 工具调用、reward 回传和 1 个 GRPO update step。
+- Qwen3-4B Base、SFT LoRA Adapter、任务转换与 veRL 启动均能正确加载。
+
+2. 当前唯一阻塞点
+- 4B GRPO 在第一次 FSDP → vLLM update_weights 时 OOM，尚未进入正式 rollout。
+- TP4、gpu_memory_utilization=0.15 时，每卡 FSDP Actor 约 20.95 GiB、vLLM 约 2.53 GiB；GPU 只剩 17.81 MiB，FSDP state_dict clone 仍需 24 MiB。
+- 减小 micro batch、rollout 数或响应长度不能解决，因为峰值发生在权重同步阶段。
+- 正式训练前必须将同步逻辑改为“只同步 LoRA Adapter”，或将 vLLM 与 Actor 分时加载/卸载；不要继续用压 batch 的方式碰运气。
+- vLLM 与 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 不兼容，本项目运行 GRPO 时不要设置该变量。
+
+二、固定路径
+
+Mac 项目：/Users/apple/code/SWE_project
+Mac Python：/opt/homebrew/Caskroom/miniconda/base/bin/python
+AutoDL 项目：/root/autodl-tmp/SWE_project
+AutoDL Python：/root/autodl-tmp/conda/envs/sweforge/bin/python
+Base 模型：/root/autodl-tmp/huggingface/hub/models--Qwen--Qwen3-4B-Base/snapshots/906bfd4b4dc7f14ee4320094d8b41684abff8539
+SFT Adapter：/root/autodl-tmp/experiments/sft_qwen3_4b_lora_r16_e1_20260809/eval/adapters/step_136
+正式训练池：/root/autodl-tmp/experiments/rl_formal_v1/dataset_v1/train/pool.jsonl（250 条）
+仓库隔离评测池：/root/autodl-tmp/experiments/rl_formal_v1/dataset_v1/eval/pool.jsonl（4 条，仅用于链路评测，正式报告前需扩到 20～50 条）
+四任务预检池：/root/autodl-tmp/SWE_project/data/grpo_toy_pool.jsonl
+训练脚本：/root/autodl-tmp/SWE_project/scripts/run_grpo_agentic.sh
+
+说明：GRPO 使用离线冻结的 task pool；训练时只在线产生多次解题轨迹，不会自动访问 GitHub 生成新任务。任务扩展和数据飞轮是训练外层的独立阶段，详见《SWE-Forge_GRPO训练数据构造与分布说明.md》。
+
+三、每次开机后的环境联通
+
+步骤 1：Mac 启动 Docker/Colima，并确认 Docker 可用
+
+  docker info
+
+步骤 2：Mac 使用 Conda base 启动 Environment Server（不要使用项目 .venv）
+
+  cd /Users/apple/code/SWE_project
+  env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+    /opt/homebrew/Caskroom/miniconda/base/bin/python \
+    -m sweforge.env_server.server \
+    --bundles-dir examples --docker --cleanup-stale 3600 --port 8501
+
+步骤 3：Mac 建立反向隧道
+
+  ssh -N -R 8500:127.0.0.1:8501 \
+    -i /Users/apple/.ssh/autodl_ed25519 \
+    -p <AutoDL端口> root@<AutoDL地址>
+
+步骤 4：AutoDL 验证联通
+
+  curl -s http://127.0.0.1:8500/health
+  cd /root/autodl-tmp/SWE_project
+  PYTHONPATH=src /root/autodl-tmp/conda/envs/sweforge/bin/python \
+    scripts/interop_mac.py --base-url http://127.0.0.1:8500
+
+通过标准：health 正常；interop 7/7；metadata 显示 backend=local-docker、docker=true、isolated=true；verify 能返回 resolved/F2P/P2P。
+
+四、正式 GRPO 前必须完成的代码验收
+
+1. 修改 veRL 权重同步：只收集并发送 LoRA A/B 参数，不 materialize/clone 4B Base 的完整 FSDP state_dict。
+2. 为同步逻辑增加回归测试：确认同步参数名全部属于 LoRA，且同步前后 vLLM 输出随 Adapter 权重变化。
+3. 继续保持 torchrun 单 driver：NPROC_PER_NODE=1、N_GPUS_PER_NODE=1；在脚本末尾 Hydra override 设置 trainer.n_gpus_per_node=4。不要直接启动四份 PPO driver。
+4. 运行前执行 unset PYTORCH_CUDA_ALLOC_CONF。
+
+五、第一阶段：四任务、一步真实闭环预检
+
+注意：下面命令只允许在“LoRA-only 权重同步”修复并通过单测后运行。默认 save_freq=-1，不产生 checkpoint。
+
+  cd /root/autodl-tmp/SWE_project
+  unset PYTORCH_CUDA_ALLOC_CONF
+  export ENV_URL=http://127.0.0.1:8500
+  export NPROC_PER_NODE=1
+  export N_GPUS_PER_NODE=1
+  export GPU_MEM_UTIL=0.20
+  export RUN_DIR=/root/autodl-tmp/experiments/grpo_preflight_4gpu_fixed
+
+  bash scripts/run_grpo_agentic.sh \
+    --model /root/autodl-tmp/huggingface/hub/models--Qwen--Qwen3-4B-Base/snapshots/906bfd4b4dc7f14ee4320094d8b41684abff8539 \
+    --adapter /root/autodl-tmp/experiments/sft_qwen3_4b_lora_r16_e1_20260809/eval/adapters/step_136 \
+    --pool /root/autodl-tmp/SWE_project/data/grpo_toy_pool.jsonl \
+    --out-dir "$RUN_DIR" \
+    --steps 1 --batch 4 --n 2 \
+    --max-prompt-length 1536 --max-response-length 512 \
+    -- \
+    trainer.n_gpus_per_node=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.max_model_len=2048 \
+    actor_rollout_ref.rollout.max_num_seqs=4 \
+    actor_rollout_ref.rollout.agent.num_workers=1
+
+预检必须同时满足：
+- 四张 GPU 被 veRL 使用，且只有一个训练 driver；
+- 加载 step_136 Adapter；
+- 日志出现 update_weights、generate_sequences、compute_score、update_actor、global_step: 1；
+- Mac 收到真实 Docker create/tool/verify 请求，不得使用 Mock reward；
+- 同一个任务的两次 rollout 最好同时出现成功和失败，使 advantage 非零；
+- grad_norm、pg_loss 为有限数；若 reward 全相同，只说明样本/策略没有形成组内差异，不算有效 GRPO 更新验收；
+- 进程能干净退出，GPU 无 Ray/vLLM 残留。
+
+日志：$RUN_DIR/train.log
+
+六、第二阶段：5 step 小规模稳定性测试
+
+使用正式训练池，但只抽一个 batch，先验证真实任务、奖励方差和连续更新：
+
+  export RUN_DIR=/root/autodl-tmp/experiments/grpo_4b_stability_5step
+  bash scripts/run_grpo_agentic.sh \
+    --model /root/autodl-tmp/huggingface/hub/models--Qwen--Qwen3-4B-Base/snapshots/906bfd4b4dc7f14ee4320094d8b41684abff8539 \
+    --adapter /root/autodl-tmp/experiments/sft_qwen3_4b_lora_r16_e1_20260809/eval/adapters/step_136 \
+    --pool /root/autodl-tmp/experiments/rl_formal_v1/dataset_v1/train/pool.jsonl \
+    --out-dir "$RUN_DIR" \
+    --steps 5 --batch 4 --n 4 \
+    --max-prompt-length 3072 --max-response-length 1024 \
+    -- \
+    trainer.n_gpus_per_node=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.max_model_len=4096 \
+    actor_rollout_ref.rollout.max_num_seqs=4 \
+    actor_rollout_ref.rollout.agent.num_workers=2 \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.ppo_epochs=1
+
+参考设置：每 step 4 个 task，每 task 4 条 rollout，共 16 条轨迹；Mac Docker 并发先设 2，稳定后再提高。无 NVLink 时优先 TP=1，避免 TP4 的 PCIe 通信损耗。
+
+五步通过标准：无 OOM/连接错误/容器泄漏；reward 不长期全 0 或全 1；组内 advantage 有方差；loss、grad_norm 有限；每步能完成 update_weights → rollout → verify → update_actor。
+
+七、第三阶段：正式 GRPO
+
+只有五步稳定性测试通过后才开始。首轮建议：
+
+- 模型：Qwen3-4B-Base + step_136 SFT LoRA；GRPO 继续只训练 LoRA。
+- 任务池：250 条 train，eval 不混入训练。
+- batch=4，G=4，即每 step 16 条 rollout。
+- max_prompt=3072，max_response=1024，max_model_len=4096。
+- learning_rate=5e-7；ppo_epochs=1；temperature=1.0。
+- 初始训练 50 step；根据 resolve rate、KL、reward 和工具调用行为决定是否继续到 100 step，不预设盲目长训。
+- save_freq=25：50 step 只保存 step25、step50 两份。每次保存后检查数据盘，至少保留 20GB 空闲。
+
+  export RUN_DIR=/root/autodl-tmp/experiments/grpo_4b_formal_v1
+  bash scripts/run_grpo_agentic.sh \
+    --model /root/autodl-tmp/huggingface/hub/models--Qwen--Qwen3-4B-Base/snapshots/906bfd4b4dc7f14ee4320094d8b41684abff8539 \
+    --adapter /root/autodl-tmp/experiments/sft_qwen3_4b_lora_r16_e1_20260809/eval/adapters/step_136 \
+    --pool /root/autodl-tmp/experiments/rl_formal_v1/dataset_v1/train/pool.jsonl \
+    --out-dir "$RUN_DIR" \
+    --steps 50 --batch 4 --n 4 --save 25 \
+    --max-prompt-length 3072 --max-response-length 1024 \
+    -- \
+    trainer.n_gpus_per_node=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.max_model_len=4096 \
+    actor_rollout_ref.rollout.max_num_seqs=4 \
+    actor_rollout_ref.rollout.agent.num_workers=2 \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.ppo_epochs=1
+
+若显存仍不足：先检查同步是否真的只包含 LoRA，再考虑把 gpu_memory_utilization 从 0.20 降到 0.15；不要先减 batch，因为同步阶段 OOM 与 batch 无关。
+
+八、评测与 checkpoint 选择
+
+至少比较：Base、SFT step68、SFT step136、GRPO step25、GRPO step50。使用同一冻结 eval pool、相同采样参数和每任务相同 rollout 次数。
+
+核心指标：
+- resolve rate / hidden test pass rate；
+- F2P 通过率、P2P 保持率；
+- tool_call 可解析率、无效调用率；
+- 平均工具调用步数、超时率；
+- 测试篡改率、越权操作率；
+- 按 repo、任务来源、mutation_type 分组的成功率。
+
+当前 eval 只有 4 条，只能做链路检查，不能作为简历最终提升数字。正式结论前扩到 20～50 条仓库隔离任务。
+
+九、数据飞轮
+
+数据飞轮不是一次 GRPO 命令自动完成。每轮训练后显式执行：
+
+  Policy profiling（每任务 G 次 rollout）
+  → 统计 source/repo/mutation_type/resolve_rate/steps/failure_type
+  → 优先选择 resolve_rate 处于中间区间的“部分可解”任务
+  → 调整 AST、Repair Reversal、Public 的生成/采样预算
+  → Docker + CleanVerifier 重新筛选
+  → 冻结新版本 task pool
+  → 下一轮 GRPO
+
+每轮必须记录 task pool 版本和 hash，保证 Base/SFT/GRPO 对比可复现。
+
+十、故障处理
+
+- 清理残留：/root/autodl-tmp/conda/envs/sweforge/bin/ray stop --force
+- 查看 GPU：nvidia-smi
+- 查看磁盘：df -h /root/autodl-tmp
+- 查看日志：tail -n 200 <RUN_DIR>/train.log
+- Mac 连接失败：先检查 Environment Server 端口，再检查 SSH 隧道，不要切换到 Mock。
+- reward 全 0：先检查 tool_call 格式、轨迹终止原因和 verifier 结果，不要立即调学习率。
+- OOM 出现在 update_weights/state_dict：检查 LoRA-only 同步；micro batch 不是这个问题的解法。
+

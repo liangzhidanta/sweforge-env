@@ -7,3 +7,14 @@ build/
 dist/
 *.egg-info/
 .DS_Store
+
+# AutoDL SSH credentials (local only, never commit)
+AUTODL_SSH.txt
+
+# 运行时监控日志（本地查看用, 不提交）
+logs/
+
+# 大数据目录（训练产物, 不入库）
+bundles_v1_bak/
+bundles_v2/
+data/

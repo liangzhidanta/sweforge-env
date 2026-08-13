@@ -207,12 +207,14 @@ class DockerExecutor:
     def __init__(
         self, image: str, container_name: str, task_id: str, env_id: str,
         workspace: str = "/workspace", docker_binary: str = "docker",
+        runtime_user: str = "1000:1000",
         protected_paths: Sequence[str] = (), max_output_chars: int = 20_000,
         max_view_lines: int = 200, limits: ContainerLimits | None = None,
     ) -> None:
         self.image = image
         self.container_name = container_name
         self.workspace = workspace
+        self.runtime_user = runtime_user
         self.root = Path(workspace)
         self.path_policy = PathPolicy(self.root, protected_paths)
         self.docker_binary = docker_binary
@@ -230,7 +232,7 @@ class DockerExecutor:
             "--cpus", str(self.limits.cpus),
             "--memory", self.limits.memory,
             "--pids-limit", str(self.limits.pids),
-            "--user", "1000:1000",
+            "--user", self.runtime_user,
             "--workdir", self.workspace,
             "--name", self.container_name,
             *(f"--label={label}" for label in container_labels(self._task_id, self._env_id, ROLE_TASK)),
@@ -275,7 +277,7 @@ class DockerExecutor:
             os.chmod(tar_path, 0o644)
             self._copy_in(tar_path, "/tmp/sweforge-seed.tar")
             result = self._exec(
-                ("/bin/sh", "-c", "tar -xf /tmp/sweforge-seed.tar -C /workspace"),
+                ("tar", "-xf", "/tmp/sweforge-seed.tar", "-C", self.workspace),
                 timeout=120, max_chars=None,
             )
             if result.exit_code != 0:
@@ -354,6 +356,10 @@ class DockerExecutor:
 
     def write_text(self, path: str, content: str) -> None:
         resolved = self.path_policy.resolve(path).as_posix()
+        mkdir = self._exec(("mkdir", "-p", str(Path(resolved).parent)), timeout=10,
+                           max_chars=None)
+        if mkdir.exit_code != 0:
+            raise OSError(mkdir.stderr.strip() or "mkdir failed")
         result = self._exec(("/bin/sh", "-c", f"cat > {resolved}"), timeout=10,
                             input_text=content, max_chars=self.max_output_chars)
         if result.exit_code != 0:

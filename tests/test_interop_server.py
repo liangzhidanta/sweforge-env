@@ -86,7 +86,7 @@ def test_segment_a_contract_direct(mac_server):
         assert client.health()
         assert client.register_task(task) == "interop-demo"
         env_id = client.create(task_id="interop-demo")
-        assert env_id == "interop-demo"
+        assert env_id.startswith("interop-demo-")
 
         obs = client.execute(env_id, BashAction(command="cat answer.txt"))
         assert obs.stdout.strip() == "the wrong answer"

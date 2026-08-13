@@ -47,12 +47,13 @@ def _client(remote_server) -> RemoteEnvironmentBackend:
 # ---------------- /v1/tasks/register + create(task_id) ----------------
 
 def test_register_then_create_by_task_id(remote_server):
-    """登记后 create 只传 task_id 引用, env_id 与 task_id 合一。"""
+    """登记后 create 只传 task_id 引用, env_id 带 -<8hex> 唯一后缀。"""
     client = _client(remote_server)
     assert client.register_task(_task(task_id="registered")) == "registered"
 
     env_id = client.create(task_id="registered")
-    assert env_id == "registered"
+    assert env_id.startswith("registered-")
+    assert len(env_id) == len("registered") + 1 + 8
     obs = client.execute(env_id, BashAction(command="echo ok"))
     assert obs.exit_code == 0
     client.destroy(env_id)
@@ -71,10 +72,34 @@ def test_create_without_task_or_id_422(remote_server):
     assert resp.status_code == 422
 
 
+def test_create_same_task_returns_unique_env_ids(remote_server):
+    """并发同 task_id 两次 create: env_id 唯一（-<8hex>）, 注册表条目独立互不覆盖。
+
+    Mock 后端工作区按 task_id[:12] 命名, 二次 create 会 rmtree 前一次的工作区
+    （mock.py:96）—— 那是 toy 后端的资源冲突, 与 server 注册表修复无关
+    （LocalDocker 每 env 独立容器）。这里只锁 server 层不变量: env_id 唯一 +
+    destroy 各自只移除自己的条目（旧代码两 create 共享 task_id key, 第二次
+    destroy 会 404）。
+    """
+    url, _ = remote_server
+    with httpx.Client(base_url=url) as c:
+        body = {"task": _task(task_id="concurrent").model_dump(mode="json")}
+        e1 = c.post("/v1/envs", json=body).json()["env_id"]
+        e2 = c.post("/v1/envs", json=body).json()["env_id"]
+    assert e1 != e2
+    assert e1.startswith("concurrent-") and e2.startswith("concurrent-")
+    assert len(e1.split("-")[-1]) == len(e2.split("-")[-1]) == 8
+
+    with httpx.Client(base_url=url) as c:
+        assert c.delete(f"/v1/envs/{e1}").status_code == 200
+        # 旧代码 envs 只 key 在 task_id 上, destroy e1 已移除共享条目 -> 这里 404
+        assert c.delete(f"/v1/envs/{e2}").status_code == 200
+
+
 # ---------------- request_id 幂等表 ----------------
 
 def test_idempotent_create_replay(remote_server):
-    """同 request_id 重发 create: 返回首次响应, 不覆盖已有 env。"""
+    """同 request_id 重发 create: 返回首次响应（同一 env_id）, 不覆盖已有 env。"""
     url, _ = remote_server
     rid = "a" * 16
     body = {"task": _task(task_id="idem-create").model_dump(mode="json"), "request_id": rid}
@@ -82,11 +107,13 @@ def test_idempotent_create_replay(remote_server):
         r1 = c.post("/v1/envs", json=body)
         r2 = c.post("/v1/envs", json=body)
     assert r1.status_code == r2.status_code == 200
-    assert r1.json() == r2.json() == {"env_id": "idem-create"}
+    assert r1.json() == r2.json()
+    env_id = r1.json()["env_id"]
+    assert env_id.startswith("idem-create-") and len(env_id.split("-")[-1]) == 8
     # 首次 env 未被覆盖: 仍可正常执行
     with httpx.Client(base_url=url) as c:
         assert c.post(
-            "/v1/envs/idem-create/reset", json={"request_id": "a" * 16 + "1"}
+            f"/v1/envs/{env_id}/reset", json={"request_id": "a" * 16 + "1"}
         ).status_code == 200
 
 
@@ -98,36 +125,40 @@ def test_idempotent_execute_replays_once(remote_server):
     """
     url, _ = remote_server
     with httpx.Client(base_url=url) as c:
-        c.post("/v1/envs", json={"task": _task(task_id="idem-act").model_dump(mode="json")})
+        env_id = c.post(
+            "/v1/envs", json={"task": _task(task_id="idem-act").model_dump(mode="json")}
+        ).json()["env_id"]
         rid = "b" * 16
         body = {
             "action": StrReplaceAction(path="answer.txt", old_string="wrong ", new_string="").model_dump(mode="json"),
             "request_id": rid,
         }
-        r1 = c.post("/v1/envs/idem-act/actions", json=body)
-        r2 = c.post("/v1/envs/idem-act/actions", json=body)
+        r1 = c.post(f"/v1/envs/{env_id}/actions", json=body)
+        r2 = c.post(f"/v1/envs/{env_id}/actions", json=body)
         assert r1.json() == r2.json()
         assert r1.json()["observation"]["success"] is True
 
         # 新 request_id 再执行同一条 action: 应失败（old_string 已不存在）
         body["request_id"] = "b" * 16 + "1"
-        r3 = c.post("/v1/envs/idem-act/actions", json=body)
+        r3 = c.post(f"/v1/envs/{env_id}/actions", json=body)
         assert r3.json()["observation"]["success"] is False
-        c.delete("/v1/envs/idem-act", params={"request_id": "b" * 16 + "2"})
+        c.delete(f"/v1/envs/{env_id}", params={"request_id": "b" * 16 + "2"})
 
 
 def test_idempotent_destroy_replay(remote_server):
     """同 request_id 重发 destroy: 返回首次响应; 新 request_id 才 404。"""
     url, _ = remote_server
     with httpx.Client(base_url=url) as c:
-        c.post("/v1/envs", json={"task": _task(task_id="idem-del").model_dump(mode="json")})
+        env_id = c.post(
+            "/v1/envs", json={"task": _task(task_id="idem-del").model_dump(mode="json")}
+        ).json()["env_id"]
         rid = "c" * 16
-        r1 = c.delete("/v1/envs/idem-del", params={"request_id": rid})
-        r2 = c.delete("/v1/envs/idem-del", params={"request_id": rid})
+        r1 = c.delete(f"/v1/envs/{env_id}", params={"request_id": rid})
+        r2 = c.delete(f"/v1/envs/{env_id}", params={"request_id": rid})
         assert r1.status_code == r2.status_code == 200
         assert r1.json() == r2.json() == {"ok": True}
         # 新 request_id: env 已被真正销毁
-        r3 = c.delete("/v1/envs/idem-del", params={"request_id": "c" * 16 + "1"})
+        r3 = c.delete(f"/v1/envs/{env_id}", params={"request_id": "c" * 16 + "1"})
         assert r3.status_code == 404
 
 

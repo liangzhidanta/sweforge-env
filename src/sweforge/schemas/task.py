@@ -40,6 +40,16 @@ class TaskEnvironment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     image: str | None = None
+    #: Agent-facing repository root inside the container.  Public executable
+    #: images (for example R2E-Gym) may ship the repository at /testbed rather
+    #: than the SWE-Forge base image's /workspace.
+    workspace: str = "/workspace"
+    #: Container uid:gid.  Defaults to the non-root SWE-Forge runtime; a public
+    #: image may explicitly require its image-native user.
+    runtime_user: str = "1000:1000"
+    #: False means the image already contains the authoritative buggy checkout.
+    #: True keeps the normal SWE-Forge bundle snapshot behaviour.
+    seed_from_snapshot: bool = True
     setup_commands: list[str] = Field(default_factory=list)
     build_commands: list[str] = Field(default_factory=list)
     #: test_id -> 运行该测试的 shell 命令

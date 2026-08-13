@@ -1,0 +1,204 @@
+# SFT 数据组织、Masking 语义与 verl/自主职责边界
+
+版本: 阶段 17.5（2026-08-09）—— 4B LoRA 全量 SFT（rank 16, 2 epoch）配套说明。
+配套代码: `scripts/smoke_sft.py` / `scripts/run_sft.sh` / `scripts/sft_lora_entry.py`。
+
+================================================================================
+1. 数据如何组织（5 层流水线）
+================================================================================
+
+    R2E-Gym 公开轨迹(3,231) -> normalize 漏斗(3,134 successful -> 3,061)
+    -> tokenize-v2 逐条渲染落库(3,061 条, 带 token 层)
+    -> max_length 8k 过滤(2,304 条, 144 步/epoch @ batch 16)
+    -> SFTTrajectoryDataset（训练加载, veRL custom_cls 扩展点）
+
+关键: tokenize-v2（tokenize.py）不是整串对话渲染, 而是逐条消息渲染
+（_render_per_message, 与 veRL MultiTurnSFTDataset 同语义）——每条消息单独
+apply_chat_template, 非首条剥离模板注入的 system prompt, 拼接 == veRL 训练侧
+实际序列。不能用整串渲染: Qwen3 模板会对最后一条 assistant 消息注入空
+<think> 标签, 逐条渲染没有。
+
+每条轨迹落库 4 个 token 层字段（训练路径禁止重新 tokenize, 铁律）:
+    prompt_ids              system + user + 全部 tool 结果（上下文, 不参与 loss）
+    response_ids            全部 assistant 段拼接（学习目标）
+    response_mask           与 response_ids 等长的掩码
+    message_token_counts    每条消息的 token 数（位置对齐关键）
+
+训练时 SFTTrajectoryDataset._build_item 按消息顺序整串重建
+input_ids（system|user|assistant1|tool1|...|assistant8）,
+loss_mask 从存储字段重建——全程不重新 tokenize。
+
+================================================================================
+2. Masking 语义（用一个真实例子）
+================================================================================
+
+统一 mask 语义（铁律）: system/user/tool = 0, assistant = 1。
+
+真实样本（sft_dataset.jsonl 第一条, Scrapy LocalCache 任务）:
+17 条消息 = system(266t) + user(377t) + 8 轮 (assistant 调用 + tool 结果) + finish
+
+    [0]  system     266t   -> prompt_ids(mask=0)
+    [1]  user       377t   -> prompt_ids(mask=0)
+    [2]  assistant   62t   {"name":"search","arguments":{...}}    ┐
+    [3]  tool        35t   './scrapy/resolver.py:0: 2 matches...' │ prompt_ids(mask=0)
+    [4]  assistant   58t   view_file -> 1057t tool 输出(文件内容)  │
+    [6]  assistant  300t   str_replace -> 20t tool(...failed)     │ 每轮都是真实
+    [8]  assistant   41t   bash 复现 -> 46t tool(exit 0)          │ agentic 多轮探索
+    [10] assistant  208t   str_replace -> 22t tool(applied)       │ 直到 finish
+    [12] assistant  510t   str_replace -> 18t tool(failed)        │
+    [14] assistant   42t   bash 验证 -> 82t tool(exit 0)          │
+    [16] assistant  279t   finish                                 ┘ -> response_ids(学习目标)
+
+    prompt_ids  1923 = 266+377+35+1057+20+46+22+18+82（system+user+8 个 tool 结果）
+    response_ids 1500 = 62+58+300+41+208+510+42+279（8 条 assistant 段）
+    训练序列   3423 tokens 按对话顺序交错; loss_mask 只在 assistant 段 = 1
+
+每条 assistant 段开头的 response_mask 实拍（前 20 个）:
+    [0, 0, 0, 1, 1, 1, 1, ...]
+    前 3 个 = 0: Qwen3 模板注入的 "<|im_start|>assistant\n"
+        （"assistant" 单 token; generation_prompt_len 差分法测得 = 3）
+    第 4 个起全 1: 工具调用 JSON 语法、字段名、参数值全部是学习目标
+
+结论: 模型学到"看到 system+user 任务和上一轮工具结果后, 如何生成下一个
+工具调用（含 tool_call 语法）, 并收敛到 finish"——agentic 行为冷启动。
+loss_token_total = 8.20M（3,061 条 response 段去掉每段 3 个模板 token）。
+
+================================================================================
+3. 证据文件清单（可逐行检查）
+================================================================================
+
+    src/sweforge/data/sft/tokenize.py:87-97     逐条渲染（veRL 同语义）
+    tokenize.py:55-72                           generation_prompt_len 差分法（Qwen3=3）
+    tokenize.py:100-139                         assistant_prefix_mask 落库 + metadata
+    src/sweforge/protocol/serialization.py:224-264  build_token_arrays 统一 mask 语义
+    src/sweforge/training/sft/dataset.py:32-58  loss_mask_from_trajectory 交错展开
+    dataset.py:124-150                          _build_item 整串重建 input_ids/loss_mask
+    data/r2egym/sft_dataset.jsonl               落库数据（3,061 条, 上面例子 = 第一条）
+    tests/test_sft_dataset.py                   veRL 语义对齐测试
+    每条记录 metadata                           loss_mask_version=verl-aligned-v1,
+                                                assistant_prefix_mask=3
+    CLAUDE.md 铁律                              SFT/RL 共用 Canonical 协议、统一 mask、
+                                                禁重新 tokenize
+
+自查命令（看任意一条的 mask 切分）:
+    /root/autodl-tmp/conda/envs/sweforge/bin/python - <<'EOF'
+    import json
+    rec = json.loads(open('/root/autodl-tmp/SWE_project/data/r2egym/sft_dataset.jsonl').readline())
+    for i, (m, n) in enumerate(zip(rec['messages'], rec['message_token_counts'])):
+        print(f"[{i}] {m['role']:9s} {n:5d} tokens",
+              rec['response_mask'][sum(rec['message_token_counts'][:i]):][:n] if m['role']=='assistant' else '')
+    EOF
+
+================================================================================
+4. verl 管理的 vs 我们管理的（三层职责边界）
+================================================================================
+
+边界一句话: verl 管"怎么训练"（引擎/机制/指标采集）, 我们管"训练什么"
+（数据/协议/mask 语义）和"以什么策略训练"（超参/显存/产物取舍）。
+干预手段 = 扩展点（custom_cls/logger）+ CLI override + 入口兼容层,
+全程不碰 verl 包（铁律）。
+
+── 4.1 verl 管理（引擎, 不可改包, 只可传参）────────────────────────────
+    模型:        HFModelConfig 加载、attn_implementation 覆盖
+    LoRA:        _build_lora_module 构建 peft adapter、冻结 base、adapter 优化
+    优化:        AdamW(lr=1e-3, wd=0.01)、clip_grad=1.0、constant 调度、seed
+    批次:        train_batch_size -> micro_batch_size_per_gpu 梯度累积;
+                 use_dynamic_bsz 按 token 上限动态调 micro; num_workers 数据管线
+    循环:        gradient accumulation、optimizer step、
+                 total_epochs/total_training_steps 停步
+    checkpoint:  写盘、max_ckpt_to_keep 滚动删（保存前删超限）、
+                 lora_train_meta.json
+    指标:        每步 loss/lr/grad_norm/global_tokens 写后端
+    分布式:      torchrun 拉起、RANK/WORLD_SIZE、elastic 错误处理
+
+── 4.2 我们管理（数据与协议, verl 不认也管不了）────────────────────────
+    训练内容:     Canonical AgentTrajectory / 五工具 / system prompt / 统一 mask
+    token 层落库: 逐条渲染、差分法 generation_prompt_len、
+                 prompt_ids/response_ids/response_mask/message_token_counts
+    loss_mask:    位置对齐重建（交错展开, 禁重新 tokenize）
+    训练策略:     epoch 数、batch/micro、LoRA rank/alpha、save 粒度/keep、
+                 max_length 过滤 -> 全部经 CLI override 传给 verl
+
+── 4.3 verl 默认行为但我们必须接管的（24GB 单卡 + 铁律的现实）───────────
+    1) 重新 tokenize:  veRL SFT 默认 HF datasets + 自己 tokenize
+       -> custom_cls 扩展点短路, 只吃落库 token 层
+    2) LoRA peft 兼容: verl 0.8 硬编码 target_parameters, peft 0.16 不接受
+       -> sft_lora_entry.py 入口 patch（同模式: flash_attn_shim）
+    3) 显存/产物策略:  默认 fp32(4B 全量 15G 驻留) -> 覆盖 model_dtype=bfloat16;
+       默认 save_contents=[model,hf_model] 全量 gather 在训练态 OOM -> [model];
+       系统盘 30G 写满 os error 28 -> 一律数据盘 /root/autodl-tmp
+
+================================================================================
+5. Dataloader 完整链路 + 遮挡语义精确定义（0/1 哪个是遮挡）
+================================================================================
+
+结论先行: loss_mask = 1 -> 学习目标（参与 loss, 露出）;
+          loss_mask = 0 -> 遮挡（不参与 loss）。
+
+    全 0（遮挡）:   system / user / tool 结果——纯上下文, 模型要"读懂"但不付 loss;
+                    assistant 段开头 3 个模板注入 token（<|im_start|> assistant \n）
+    全 1（学习）:   assistant 内容所有 token——自然语言、tool_call JSON 语法、
+                    字段名、参数、finish 收尾
+
+dataloader 链路（谁在哪一步做什么）:
+    ① veRL create_sft_dataset -> custom_cls -> SFTTrajectoryDataset
+         一次性把 2,304 条轨迹重建为整串 tensor（input_ids/attention_mask/
+         position_ids/loss_mask）, 全程不重新 tokenize（铁律）
+    ② veRL DataLoader 按 step 取 train_batch_size=16 条 -> NestedTensor
+         pad_mode=no_padding: 变长序列不打 padding 直接打包（省显存）
+    ③ use_dynamic_bsz: max_token_len_per_gpu=8192（token 上限）+
+         micro_batch_size_per_gpu=2（样本上限）动态切 micro
+    ④ 每 micro forward -> log_prob -> sft_loss 消费 loss_mask（见下）
+    ⑤ 8 个 micro 梯度累积 -> optimizer.step（AdamW lr=1e-3）
+
+verl loss 端如何消费 mask（verl/workers/utils/losses.py:28-54, 实锤）:
+    loss_mask = data["loss_mask"]                    # [bsz, seq_len] 每样本
+    loss_mask_flatten = loss_mask.values()           # NestedTensor 展平
+    loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)  # ★左移1位
+    loss = -masked_sum(log_prob, loss_mask_flatten) / batch_num_tokens * dp_size
+
+    关键: mask 左移一位。SFT 是"预测下一个 token"——位置 i 的 log_prob 预测的是
+    token i+1。roll 后语义: mask[i]=1 <==> token i 是被预测的目标, 模型必须学会
+    正确预测它。分母 batch_num_tokens = loss_mask.sum()（transformer_impl.py:622）,
+    即 loss 平均到学习 token 数（非序列总长）。
+
+================================================================================
+6. 真实样本逐 token 演示（sft_dataset.jsonl 第 1 条, 3423 tokens）
+================================================================================
+
+段边界: system@0-266 | user@266-643 | assistant@643-705 | tool@705-740 |
+        assistant@740-798 | tool@798-1855 | ... | assistant@3144-3423(finish)
+
+① system 开头（上下文, 遮挡）:
+       0 | 0 masked | '<|im_start|>'
+       1 | 0 masked | 'system'
+       3 | 0 masked | 'You'
+       7 | 0 masked | 'Ġagent'       <- system 全段 266 token 全 0
+
+③ 模板注入边界（第 1 条 assistant 开头）:
+     642 | 0 masked | '<|im_end|>'          <- user 段末尾
+     643 | 0 masked | '<|im_start|>'        ┐ 模板注入 3 token, 遮挡
+     644 | 0 masked | 'assistant'           │（差分法 generation_prompt_len=3 吻合）
+     645 | 0 masked | 'Ċ'                   ┘ 但 645 预测 646 要学（roll 语义）
+     646 | 1 learn  | 'I'                   ┐ 从第一个内容 token 起
+     647 | 1 learn  | "'ll"                 │ 全部学习
+     648 | 1 learn  | 'Ġhelp'               ┘ 含自然语言 + JSON 语法
+
+④ assistant 中段（tool_call JSON, 全学）:
+     673 | 1 learn | 'Ġrepository'
+     678 | 1 learn | ':Ċ'                   <- JSON 冒号/换行也是目标
+
+⑤ tool 结果开头（遮挡, 包装成 <tool_response> 的 user 消息）:
+     703 | 1 learn | '<|im_end|>'           <- assistant 最后 token: 预测 704 要学
+     705 | 0 masked | '<|im_start|>'
+     708 | 0 masked | '<tool_response>'     <- 工具输出整个遮挡（1057 tokens 全 0）
+
+⑥ finish 收尾:
+    3144 | 0 masked | '<|im_start|>'        <- 模板注入
+    3146 | 0 masked | 'Ċ'
+    3147 | 1 learn  | 'Perfect'             <- finish 文本全学
+
+数字自洽验证: response_ids 1500 = 8 条 assistant 段; 每段去 3 个模板 token
+-> 1500 - 8x3 = 1476 = 实际 mask=1 数（43.1% of 3423）✓
+
+逐 token 完整输出命令: 见 §3 自查命令（可加 --idx 参数看任意样本任意区段）。

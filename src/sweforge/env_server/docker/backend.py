@@ -14,6 +14,7 @@ TaskSpec 不能削弱完整性）。
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ from sweforge.env_server.docker.executors import DockerExecutor, Executor, Local
 from sweforge.env_server.docker.tools import execute_action
 from sweforge.env_server.docker.verify import verify_clean
 from sweforge.protocol.tools import FinishAction, ToolAction, ToolObservation
-from sweforge.schemas.task import TaskSpec
+from sweforge.schemas.task import MutationInfo, TaskSpec
 from sweforge.schemas.verification import VerificationResult
 
 __all__ = [
@@ -55,9 +56,42 @@ class EnvHandle:
     closed: bool = False
 
 
+def _coerce_manifest_task(task_data: dict) -> dict:
+    """容忍 AutoDL Data Factory 在 mutation 上写出的扩展记账字段。
+
+    vendored MutationInfo 是 extra=forbid, 而 bundle 生成器会写出比 schema 更多
+    的字段（entity / reference_state / target_index…）; 这些字段与 env 执行和
+    验证无关。这里只保留 vendored 已知字段。字段清单从 MutationInfo.model_fields
+    推导, 上游 schema 演进时自动跟随, 无需手动维护。
+    """
+    mutation = task_data.get("mutation")
+    if not isinstance(mutation, dict):
+        return task_data
+    allowed = set(MutationInfo.model_fields)
+    if not set(mutation) - allowed:
+        return task_data
+    kept = {key: value for key, value in mutation.items() if key in allowed}
+    return {**task_data, "mutation": kept}
+
+
+_BUNDLE_SUFFIX = re.compile(r"-[0-9a-f]{12}$")
+
+
+def _bundle_path(bundles_dir: Path, task_id: str) -> Path:
+    """精确匹配优先; 失败则剥离 AutoDL 并发唯一后缀 `-<12hex>` 再查。
+
+    两者皆无返回未剥离路径 -> 触发既有空模板回退（行为不变）。
+    """
+    for candidate in (task_id, _BUNDLE_SUFFIX.sub("", task_id)):
+        p = bundles_dir / candidate
+        if p.exists():
+            return p
+    return bundles_dir / task_id
+
+
 def load_task_bundle(bundle_dir: Path) -> TaskBundle:
     manifest = json.loads((bundle_dir / "task_manifest.json").read_text(encoding="utf-8"))
-    task = TaskSpec.model_validate(manifest["task"])
+    task = TaskSpec.model_validate(_coerce_manifest_task(manifest["task"]))
     repo_path = bundle_dir / "repo"
     hidden_tests = bundle_dir / "private" / "hidden_tests"
     if not repo_path.is_dir():
@@ -125,10 +159,13 @@ class LocalDockerBackend(EnvironmentBackend):
                 task_id=bundle.task.task_id,
                 env_id=bundle.task.task_id,
                 docker_binary=self.docker_binary,
+                workspace=bundle.task.environment.workspace,
+                runtime_user=bundle.task.environment.runtime_user,
                 max_output_chars=self.max_output_chars,
                 max_view_lines=self.max_view_lines,
             )
-            docker.seed_from_snapshot(bundle.repo_path)
+            if bundle.task.environment.seed_from_snapshot:
+                docker.seed_from_snapshot(bundle.repo_path)
             return docker
         return LocalExecutor.from_snapshot(
             bundle.repo_path,
@@ -144,7 +181,7 @@ class LocalDockerBackend(EnvironmentBackend):
         workspace that setup_commands populate, no hidden tests — matching how
         AutoDL's mock backend creates an environment from a bare TaskSpec.
         """
-        bundle_dir = self.bundles_dir / task.task_id
+        bundle_dir = _bundle_path(self.bundles_dir, task.task_id)
         if (bundle_dir / "task_manifest.json").is_file():
             return load_task_bundle(bundle_dir)
         return TaskBundle(
